@@ -1,0 +1,505 @@
+import itertools
+import os
+import pickle
+import random
+from collections import defaultdict, Counter
+from typing import List, Union, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+from torch.distributions import Laplace
+from torch.nn.utils.rnn import pad_sequence
+
+N_ACTIONS = 4
+VAR = 1
+seed = 42
+DEFAULT_NOISE_LIST = ["normal_0"]
+np.random.seed(seed)
+random.seed(seed)
+torch.manual_seed(seed)
+# https://medium.com/@rekalantar/variational-auto-encoder-vae-pytorch-tutorial-dce2d2fe0f5f
+
+
+class TensorCache:
+    def __init__(self, max_size=10000):
+        self.cache = dict()
+        self.max_size = max_size
+
+    @staticmethod
+    def get_cache_key(tensor, *args, **kwargs):
+        # Convert tensor to list for hashing
+        return (tuple(tensor.tolist()),) + args + tuple(sorted(kwargs.items()))
+
+    def __call__(self, fn):
+        def wrapped_fn(tensor, *args, **kwargs):
+            key = self.get_cache_key(tensor, *args, **kwargs)
+            if key in self.cache:
+                return self.cache[key]
+            result = fn(tensor, *args, **kwargs)
+            self.cache[key] = result
+            if len(self.cache) > self.max_size:
+                self.cache.popitem()
+            return result
+        return wrapped_fn
+
+
+class DenseVAE(nn.Module):
+    def __init__(self, input_length: int, n_words: int, device: torch.device,
+                 variance_for_sample: int = 1, decoder_input_size: int = 16):
+        super().__init__()
+        self.decoder_input_size = decoder_input_size
+        self.device = device
+
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(input_length * n_words, self.decoder_input_size * 2),
+            torch.nn.InstanceNorm1d(self.decoder_input_size * 2),
+            torch.nn.LeakyReLU(0.2),
+            torch.nn.Linear(self.decoder_input_size * 2, self.decoder_input_size),
+            torch.nn.InstanceNorm1d(self.decoder_input_size),
+            torch.nn.LeakyReLU(0.2),
+            torch.nn.Linear(self.decoder_input_size, self.decoder_input_size),
+            torch.nn.InstanceNorm1d(self.decoder_input_size),
+            torch.nn.Tanh()
+        )
+
+        self.decoder = torch.nn.Sequential(
+            torch.nn.Linear(self.decoder_input_size, self.decoder_input_size),
+            torch.nn.InstanceNorm1d(self.decoder_input_size),
+            torch.nn.LeakyReLU(0.2),
+            torch.nn.Linear(self.decoder_input_size, self.decoder_input_size * 2),
+            torch.nn.InstanceNorm1d(self.decoder_input_size * 2),
+            torch.nn.LeakyReLU(0.2),
+            torch.nn.Linear(self.decoder_input_size * 2, input_length * n_words),
+            torch.nn.InstanceNorm1d(input_length * n_words),
+        )
+        self.decoder_last_layer = nn.Sigmoid()
+
+        self.mean_layer = nn.Linear(self.decoder_input_size, self.decoder_input_size)
+        self.logvar_layer = nn.Linear(self.decoder_input_size, self.decoder_input_size)
+        self.norm = torch.distributions.Normal(0, variance_for_sample)
+        
+        # Initialize weights to match Actor/Critic initialization strategy
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """Initialize weights using Kaiming initialization for LeakyReLU networks."""
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_uniform_(module.weight,
+                                     a=0.2,  # slope=0.2 for LeakyReLU(0.2)
+                                     mode='fan_in',
+                                     nonlinearity='leaky_relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def encode(self, x):
+        x = self.encoder(x)
+        mean, logvar = self.mean_layer(x), self.logvar_layer(x)
+        return mean, logvar
+
+    def decode(self, x):
+        logits = self.decoder(x)
+        return self.decoder_last_layer(logits), logits
+
+    def reparameterization(self, mean, var):
+        epsilon = self.norm.sample(var.shape).to(self.device)
+        z = mean + var * epsilon
+        return z
+
+    def forward(self, x, get_z: bool = False):
+        mean, logvar = self.encode(x)
+        z = self.reparameterization(mean, logvar)
+        x_hat, x_hat_logits = self.decode(z)
+        if get_z:
+            return x_hat, mean, logvar, x_hat_logits, z
+        return x_hat, mean, logvar, x_hat_logits
+
+    @staticmethod
+    def convert_action_list_to_one_hot_tensor(action_list: List[int]) -> torch.Tensor:
+        seq_ten = torch.Tensor(action_list)
+        one_hot = torch.FloatTensor(10, 5).zero_()
+        one_hot.scatter_(-1, seq_ten.to(torch.int64).unsqueeze(-1), 1)
+        return one_hot
+
+    def get_reconstructed_action_list_with_embedding(self, action_l: List[int]):
+        one_hot_action = self.convert_action_list_to_one_hot_tensor(action_list=action_l)
+        x_hat, _, _, embedding, _ = self.forward(x=one_hot_action.flatten().unsqueeze(0), get_z=True)
+        reconstructed_action_seq = x_hat.reshape(len(action_l), N_ACTIONS + 1).argmax(-1)
+        return reconstructed_action_seq, embedding
+
+
+    @staticmethod
+    @TensorCache()
+    def trim_action_sequence_from_eos_tokens(actions: torch.Tensor, eos_token: int = 4) -> tuple[torch.Tensor, bool]:
+        # find the index where eos_token token appears in the tensor
+        eos_token_idx_tensor = (actions == eos_token).nonzero()
+
+        # handle cases where eos_token is the first element, replace it with the subsequent number
+        if eos_token_idx_tensor.numel() > 0 and eos_token_idx_tensor[0] == 0:
+            subsequent_number = actions[eos_token_idx_tensor[0] + 1]
+            actions[eos_token_idx_tensor[0]] = subsequent_number
+
+        # trim the action sequence until the EOS token
+        eos_token_idx_tensor = (actions == eos_token).nonzero(as_tuple=True)[0]
+        if len(eos_token_idx_tensor) != 0:
+            actions = actions[:eos_token_idx_tensor[0]]
+
+        if len(actions) == 0:
+            print("invalid - empty action sequence")
+            actions = torch.tensor([1])
+            return actions, True
+
+        return actions, False
+
+
+class MazeDataLoaderV2:
+    def __init__(self, f_names_list: List[str], augment_more_data: bool = False, use_one_hot: bool = True, padding_val: int = None,
+                 ae_input_size: int = 10, merge_all_into_train: bool = False):
+        self.f_name_l = f_names_list
+        self.bs = 1
+        self.use_one_hot = use_one_hot
+        self.input_size = 5 if use_one_hot else 1
+        self.n_actions = N_ACTIONS
+        self.padding = padding_val if padding_val else 4
+        self.ae_input_size = ae_input_size
+        self.matching_action_mapping = {0: 1, 1: 0, 2: 3, 3: 2}
+        self.augment_more_data = augment_more_data
+        self.merge_all_into_train = merge_all_into_train
+
+    def convert_action(self, action: int) -> Union[float, np.array]:
+        if self.use_one_hot:
+            coding = np.zeros(self.n_actions + 1)
+            coding[action] = 1.0
+        else:
+            coding = -1.0
+            coding += 0.5 * action
+        return coding
+
+    def pad(self, epi_list: list, list_new_size: int) -> list:
+        if len(epi_list) != list_new_size:
+            epi_list.extend([self.convert_action(self.padding)] * (list_new_size - len(epi_list)))
+        return epi_list
+
+    def prepare_list(self, df: pd.DataFrame, cat: str, col: str = 'epi_with_padding', cutoff: Union[int, list] = None,
+                     n_samples: int = 2) -> list:
+        if (cat == 'train') or (cat == 'validation'):
+            chunk_size = self.bs
+        elif cat == 'test':
+            chunk_size = 1
+        else:
+            raise Exception("ERROR - wrong category. data category should be train/validation/test")
+        series = df[col]
+        chunks = list()
+        num_chunks = len(series) // chunk_size + (1 if len(series) % chunk_size else 0)
+        for i in range(num_chunks):
+            chunk = series[i * chunk_size:(i + 1) * chunk_size].tolist()
+            if cutoff:
+                if isinstance(cutoff, list):
+                    chosen_cut = np.random.choice(cutoff)
+                else:
+                    chosen_cut = cutoff
+                initials = [[(random.randint(0, max(len(c) - chosen_cut, 0))) for b in range(n_samples)] for c in chunk]
+                chunk = [[c[initial: initial + chosen_cut] for initial in initials[idx]] for idx, c in enumerate(chunk)]
+            chunk = [self.convert_action(act) for act in chunk[0]]
+            chunk = self.pad(chunk, self.ae_input_size)
+            chunk_arr = np.array(chunk)
+            chunk_torch = torch.from_numpy(chunk_arr).type(torch.FloatTensor)
+            chunks.append(chunk_torch)
+        return chunks
+
+    @staticmethod
+    def split_into_train_test_val(df: pd.DataFrame, bin_col_name: str, train_ratio: Union[float, int] = 0.7,
+                                  val_ratio: Union[float, int] = 0.15
+                                  ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        :param df:
+        :param bin_col_name: should be 'bins' if we want fixed length sequences or 'max_len' if we want different
+        length sequences
+        :param train_ratio:
+        :param val_ratio:
+        :return:
+        """
+        df_train, df_val, df_test = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        for b_size in df[bin_col_name].unique().tolist():
+            slice_df = df[df[bin_col_name] == b_size]
+            slice_df = slice_df.sample(frac=1).reset_index(drop=True)
+            if train_ratio < 1:
+                df_len = slice_df.shape[0]
+                temp_slide_df_train = slice_df.iloc[:int(df_len * train_ratio), :]
+                temp_slide_df_val = slice_df.iloc[int(train_ratio * df_len):int(df_len * (train_ratio + val_ratio)), :]
+                temp_slide_df_test = slice_df.iloc[int((train_ratio + val_ratio) * df_len):, :]
+            else:
+                temp_slide_df_train = slice_df.iloc[:train_ratio, :]
+                temp_slide_df_val = slice_df.iloc[train_ratio:train_ratio + val_ratio, :]
+                temp_slide_df_test = slice_df.iloc[train_ratio + val_ratio:, :]
+
+            if df_train.empty:
+                df_train = temp_slide_df_train
+            else:
+                df_train = pd.concat([df_train, temp_slide_df_train], ignore_index=True)
+
+            if df_val.empty:
+                df_val = temp_slide_df_val
+            else:
+                df_val = pd.concat([df_val, temp_slide_df_val], ignore_index=True)
+
+            if df_test.empty:
+                df_test = temp_slide_df_test
+            else:
+                df_test = pd.concat([df_test, temp_slide_df_test], ignore_index=True)
+
+        return df_train, df_val, df_test
+
+    def get_train_val_test_data_eos_version(self, reserve_two_words: bool = False):
+        episodes_l = []
+        for f_name in self.f_name_l:
+            with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'dense_autoencoder/db', f_name), 'rb'
+                      ) as fp:
+                cur_episode_l = pickle.load(fp)
+                episodes_l.extend(cur_episode_l)
+        sorted_episode_l = sorted(episodes_l, key=lambda x: len(x), reverse=True)
+        # remove duplicates:
+        sorted_episode_l.sort()
+        sorted_episode_l = list(epi for epi, _ in itertools.groupby(sorted_episode_l))
+        if isinstance(sorted_episode_l[0][0], tuple):  # True == we have (state, action) and we want action
+            sorted_episode_l = [[a[1] + 2 * reserve_two_words for a in b] for b in
+                                sorted_episode_l]  # if reserve_two_words == True then all words are shifted by 2 (0 --> 2, 1--> 3..)
+        else:
+            sorted_episode_l = [[a + 2 * reserve_two_words for a in b] for b in sorted_episode_l]
+
+        episodes_df = pd.DataFrame({'episode': sorted_episode_l, 'len': [len(a) for a in sorted_episode_l]})
+        episodes_df = episodes_df[(episodes_df.len >= 1) & (episodes_df.len <= 10)]
+
+        col_name = 'len'
+        train_df, val_df, test_df = self.split_into_train_test_val(df=episodes_df, bin_col_name=col_name)
+        if self.merge_all_into_train:
+            train_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
+
+        if self.augment_more_data:
+            ten_sequence_size = train_df[train_df.len == self.ae_input_size].shape[0]
+            for action_seq_length in range(1, self.ae_input_size):
+                n_missing_seq = ten_sequence_size - train_df[train_df.len == action_seq_length].shape[0]
+                n_times_multiple = (n_missing_seq // train_df[train_df.len == action_seq_length].shape[0])
+                if n_times_multiple == 0:
+                    sampled_data_df = train_df[train_df.len == action_seq_length].sample(n=n_missing_seq)
+                else:
+                    sampled_data_df = pd.concat([train_df[train_df.len == action_seq_length]] * n_times_multiple)
+                    sampled_data_df = pd.concat([sampled_data_df, train_df[train_df.len == action_seq_length].sample(
+                        n=n_missing_seq - sampled_data_df.shape[0])])
+                if action_seq_length == 1:  # first index
+                    total_sample_df = sampled_data_df
+                else:
+                    total_sample_df = pd.concat([sampled_data_df, total_sample_df], ignore_index=True)
+            train_df = pd.concat([train_df, total_sample_df], ignore_index=True)
+
+        train_torch = self.prepare_list(train_df, cat='train', n_samples=1, col='episode')
+        val_torch = self.prepare_list(val_df, cat='validation', n_samples=1, col='episode')
+        test_torch = self.prepare_list(test_df, cat='test', col='episode')
+
+        if self.augment_more_data:
+            updated_train_torch = []
+            for action_seq, action_seq_len in zip(train_torch, train_df.len):
+                if action_seq_len <= 5:  # augment data for short sequences only
+                    if random.randint(0, self.ae_input_size) > 3:
+                        # Get the indices where the tensor is equal to 1
+                        indices = (action_seq == 1).nonzero(as_tuple=False)
+                        # Update the first k indices with random floats between 0.9 and 1.0
+                        for action_seq_length in range(min(action_seq_len, len(indices))):
+                            action_seq[indices[action_seq_length][0], indices[action_seq_length][1]] = random.uniform(0.9, 1.0)
+                updated_train_torch.append(action_seq)
+            train_torch = updated_train_torch
+        if self.merge_all_into_train:
+            return train_torch, None, None, torch.Tensor(train_df.len), None, None
+        return train_torch, val_torch, test_torch, torch.Tensor(train_df.len), torch.Tensor(val_df.len), torch.Tensor(test_df.len)
+
+    def inverse_transform_sequence(self, sequence: torch.tensor) -> Tuple[torch.tensor, torch.tensor]:
+        # unflatten seq:
+        squeezed = sequence.reshape(-1, self.input_size)
+        act_list = squeezed.argmax(1)
+        return squeezed, act_list
+
+    @staticmethod
+    def transform_sequence(sequence: torch.tensor) -> torch.tensor:
+        return torch.nn.functional.one_hot(sequence, num_classes=5)
+
+
+def get_model_performance_on_set(seq_set, eval_model, c_mzl, seq_set_len, extract_embedding: bool = False):
+    n_errors = 0
+    n_diff_elements_l = []
+    total_loss = 0
+    embedding_map_l = []
+    for seq, seq_len in zip(seq_set, seq_set_len):
+        fl_seq = seq.flatten()
+        with torch.no_grad():
+            if extract_embedding:
+                recon_seq, mean_seq, log_var_seq, _, embedding = eval_model(fl_seq.unsqueeze(0), True)
+            else:
+                recon_seq, mean_seq, log_var_seq, _ = eval_model(fl_seq.unsqueeze(0), False)
+        recon_one_hot, recon_act_seq = c_mzl.inverse_transform_sequence(recon_seq)
+        _, act_seq = c_mzl.inverse_transform_sequence(seq)
+        if extract_embedding:
+            embedding_map_l.append((act_seq.tolist(), embedding))
+        n_diff_elements = int((True ^ torch.eq(recon_act_seq, act_seq)).sum())  # number of different actions in sequence
+        n_diff_elements_l.append(n_diff_elements)
+        if n_diff_elements > 0:
+            n_errors += 1
+        seq_loss = loss_function(fl_seq.unsqueeze(0), recon_seq, mean_seq, log_var_seq, desired_var=VAR, x_seq_len=seq_len)
+        total_loss += seq_loss
+    if extract_embedding:
+        return total_loss / len(seq_set), n_errors, np.mean(n_diff_elements_l), embedding_map_l
+    return total_loss/len(seq_set), n_errors, np.mean(n_diff_elements_l)#, n_diff_elements_l
+
+
+def combine_lists_iteratively(list1, list2, k):
+    combined_list = [
+        element
+        for i in range(0, max(len(list1), len(list2)), k)
+        for element in list1[i:i+k] + list2[i:i+k]
+    ]
+    return combined_list
+
+
+def get_noise_per_cat(noise_cat: str, actor_n_channels: int) -> torch.Tensor:
+    if noise_cat == 'normal_0.9':
+        return torch.FloatTensor(actor_n_channels).normal_(mean=0.9, std=1)
+    if noise_cat == 'normal_-0.9':
+        return torch.FloatTensor(actor_n_channels).normal_(mean=-0.9, std=1)
+    if noise_cat == 'normal_0-3':
+        return torch.FloatTensor(actor_n_channels).normal_(mean=0, std=3)
+    if noise_cat == 'normal_0':
+        return torch.FloatTensor(actor_n_channels).normal_(mean=0, std=1)
+    if noise_cat == 'uniform':
+        return torch.FloatTensor(actor_n_channels).uniform_(-1, 1)
+    if noise_cat == 'bernoulli':
+        return torch.FloatTensor(actor_n_channels).bernoulli_(0.5)
+    if noise_cat == 'exponential':
+        return torch.FloatTensor(actor_n_channels).exponential_(lambd=1.0)
+    if noise_cat == 'laplace':
+        return Laplace(0, 1).sample([actor_n_channels])
+
+
+def evaluate_k_seq_in_decoder(decoder, action_db_path: str, n_samples: int = 10000, decoder_input_size: int = 16, compress_prints: bool = False,
+                              noise_cat_list: List[str] = DEFAULT_NOISE_LIST) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    with torch.no_grad():
+        action_d = pd.read_pickle(action_db_path, compression='gzip')
+        for noise_cat in noise_cat_list:
+            action_seq_l = []
+            action_seq_d = defaultdict(list)
+            coverage_dict = defaultdict(float)
+            print(f'============ {noise_cat} ============')
+            for i in range(n_samples):
+                rand_noise = get_noise_per_cat(noise_cat=noise_cat, actor_n_channels=decoder_input_size).to(device)
+                if isinstance(decoder, DenseVAE):  # during decoder training
+                    rand_action_seq = decoder.decoder(rand_noise.unsqueeze(0)).reshape(-1, 10, 5).argmax(-1)
+                    action_sequence, _ = decoder.trim_action_sequence_from_eos_tokens(rand_action_seq.squeeze(0))
+                else:  # outside of training - decoder is wrapped in a ActorGen tool
+                    rand_action_seq = decoder.gen_action_seq(rand_noise.unsqueeze(0))[1].argmax(-1)
+                    action_sequence, _ = decoder.model.trim_action_sequence_from_eos_tokens(rand_action_seq[0])
+                action_seq_l.append(action_sequence)
+                action_seq_len = action_sequence.size(0)
+                action_seq_d[action_seq_len].append(str(action_sequence.tolist()))
+            action_seq_size_l = [len(a) for a in action_seq_l]
+
+            for action_seq_len, action_seq_list in action_d.items():
+                curr_set = set(action_seq_d[action_seq_len])
+                counter = 0
+                for action_seq in action_seq_list:
+                    if action_seq in curr_set:
+                        counter += 1
+                coverage = counter/len(action_seq_list)
+                coverage_dict[action_seq_len] = np.round(coverage, 3)
+                if not compress_prints:
+                    print(f"size: {action_seq_len}, coverage: {coverage}")
+            if compress_prints:
+                print(f"valid coverage: {coverage_dict}")
+            print(f"total length distribution: {[(k, np.round(v/n_samples, 3)) for (k,v) in sorted(Counter(action_seq_size_l).items())]}")
+
+
+def loss_function(x, x_hat, mean, log_var, x_seq_len, desired_var, smoothing=0.1):
+    smoothed_labels = x * (1 - smoothing) + smoothing / 2
+
+    seq_len_tensor = torch.stack(x_seq_len) if isinstance(x_seq_len, list) else x_seq_len
+    reproduction_loss = (nn.functional.binary_cross_entropy(x_hat, smoothed_labels, reduction='none').sum(-1) / seq_len_tensor).sum()
+    KLD = -0.5 * torch.sum(1+log_var - (1/desired_var) * (mean.pow(2) + log_var.exp()) - np.log(desired_var))
+    return reproduction_loss + KLD
+
+
+if __name__ == '__main__':
+
+    f_names = [
+        'action_seq_db_1_to_10_2_act_in_seq_v1.pickle',
+    ]
+    merge_all_into_train = True
+    mzl = MazeDataLoaderV2(f_names_list=f_names, augment_more_data=False, merge_all_into_train=merge_all_into_train)
+    train_iter, _, _, train_seq_len, _, _ = mzl.get_train_val_test_data_eos_version(reserve_two_words=False)
+    # Model Initialization
+    model = DenseVAE(input_length=10, n_words=5, variance_for_sample=VAR, device=torch.device("cpu"))
+
+    lr = 1e-4
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-3)
+
+    epochs = 20000
+
+    batch_size = 32
+    outputs = []
+    losses = []
+    batch_losses = []
+    train_data_l = []
+    val_data_l = []
+    train_len_tuple_iter = [(seq, seq_len) for seq, seq_len in zip(train_iter, train_seq_len)]
+    short_train_len_tuple_iter = [(seq, seq_len) for seq, seq_len in train_len_tuple_iter if seq_len <= 5]
+    long_train_len_tuple_iter = [(seq, seq_len) for seq, seq_len in train_len_tuple_iter if seq_len > 5]
+    for epoch in range(epochs):
+        overall_loss = 0
+        random.Random(4).shuffle(short_train_len_tuple_iter)
+        random.Random(4).shuffle(long_train_len_tuple_iter)
+        short_long_train_len_tuple_iter = combine_lists_iteratively(short_train_len_tuple_iter, long_train_len_tuple_iter, batch_size // 2)
+        batch_idx = 0
+        batch_loss = 0
+
+        c_train_iter = [a[0] for a in short_long_train_len_tuple_iter]
+        c_train_seq_len = [a[1] for a in short_long_train_len_tuple_iter]
+        for i in range(0, len(c_train_iter), batch_size):
+            batch_idx += 1
+            optimizer.zero_grad()
+            image_batch_l = train_iter[i:i+batch_size]
+            image_len_batch_l = c_train_seq_len[i:i + batch_size]
+            image_batch_tensor = torch.stack(image_batch_l)
+            flatten_batch = image_batch_tensor.flatten(1)
+
+            reconstructed_batch, mean, log_var, _ = model(flatten_batch)
+
+            loss = loss_function(flatten_batch, reconstructed_batch, mean, log_var, image_len_batch_l,
+                                 desired_var=VAR)
+
+            overall_loss += loss.item()
+
+            # Storing the losses in a list for plotting
+            losses.append(loss)
+            loss.backward()
+            optimizer.step()
+        if epoch % 50 == 0:
+            model.eval()
+            print("\tEpoch", epoch + 1, "\tAverage Loss: ", overall_loss / (batch_idx * batch_size))
+
+            train_loss, train_n_errors, train_n_errors_in_set = get_model_performance_on_set(seq_set=train_iter, eval_model=model, c_mzl=mzl,
+                                                                                             seq_set_len=train_seq_len)
+            print(
+                f'epoch: {epoch}/{epochs}. loss in train set: {train_loss}, # wrong sequences: {train_n_errors}, avg errors in seq: {train_n_errors_in_set}')
+            train_data_l.append((train_loss, train_n_errors, train_n_errors_in_set))
+
+            if epoch % 200 == 0:
+                evaluate_k_seq_in_decoder(decoder=model, action_db_path='db/action_sequence_dict_by_sequence_length_entire_db.pkl.gzip',
+                                          n_samples=10000,
+                                          decoder_input_size=model.decoder_input_size, compress_prints=True)
+            model.train()
+        # if epoch % 1000 == 0:
+            # torch.save(model.state_dict(), f'middle_denseAE_generic_2act_seq_VAE_v7_bs={batch_size}_epochs={epoch}-{epochs}_lr={lr}_end_size_16_var_{VAR}_leakyrelu_normalized_by_seq_len_without_aug_instance_norm.pt')
+        # if epoch >= epochs-1:
+            # torch.save(model.state_dict(), f'denseAE_generic_2act_seq_VAE_v7_bs={batch_size}_epochs={epoch}-{epochs}_lr={lr}_end_size_16_var_{VAR}_leakyrelu_normalized_by_seq_len_without_aug_instance_norm.pt')
+
+
+
+

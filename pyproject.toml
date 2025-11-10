@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "generative-proto-sequence"
+version = "0.1.0"
+description = ""
+authors = ["Liad Giladi <liadgiladi@gmail.com>", "Netanel Fried <friednet@post.bgu.ac.il>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+stable-baselines3 = {extras = ["extra"], version = "^2.2.1"}
+minigrid = "^2.3.1"
+gymnasium = "^0.29.1"
+seaborn = "^0.13.2"
+tqdm = "^4.66.2"
+torchvision = "^0.17.1"
+tyro = "^0.7.3"
+numpy = "^1.26.4"
+moviepy = "^1.0.3"
+wandb = "^0.16.3"
+gym-simplegrid = "^1.0.5"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
