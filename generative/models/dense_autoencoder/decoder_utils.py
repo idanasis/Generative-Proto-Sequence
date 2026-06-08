@@ -27,70 +27,82 @@ class ActionGen:
 
     def gen_action_seq(self, gen_input, get_actions_as_one_hot: bool = False,
                        exclude_decoder_from_computation_graph: bool = False, deterministic_mode: bool = False):
-        def get_action_seq_as_scaled_probs(logits, temperature=0.01):
-            scaled_probs = self.temperature_scaled_softmax(logits, temperature=0.01)
+        """Autoregressively decode an action sequence from the conditioning latent ``z``.
 
-            return None, scaled_probs
+        The decoder is now a causal Transformer (``mingpt_decoder.GPT``) rather than a
+        single-shot MLP, so the sequence is produced token-by-token: at each step the
+        Transformer is conditioned on ``z`` (the prefix token) plus the tokens generated
+        so far, and emits a distribution over the next token. The per-step distribution is
+        turned into the same representation the old code returned -- temperature-scaled
+        probabilities, a Gumbel-Softmax one-hot, a straight-through one-hot, or a plain
+        argmax one-hot -- and the chosen token is fed back in for the next step.
 
-        def get_action_seq_deterministic_inference(logits):
-            probs = self.model.decoder_last_layer(logits)
-            probs = probs.reshape(-1, self.n_action_seq_length, self.n_words)
-            # Instead of Gumbel-Softmax, use a deterministic argmax with a straight-through estimator
+        Gradients still reach ``z`` because the latent prefix conditions *every* step;
+        the discrete tokens fed back are detached (we never differentiate through the
+        sampling history), mirroring standard straight-through / Gumbel practice.
+
+        Returns:
+            ``(None, scaled_probs)`` when ``get_actions_as_one_hot`` is False, else
+            ``(one_hot, None)``. Both sequence tensors keep the historical shape
+            ``(batch, n_action_seq_length, n_words)``.
+        """
+        z = gen_input
+
+        def emit_scaled_probs(step_logits: torch.Tensor) -> torch.Tensor:
+            # Temperature-scaled softmax over the vocabulary for a single step.
+            # temperature_scaled_softmax expects (batch, seq, vocab) and softmaxes dim=2.
+            return self.temperature_scaled_softmax(step_logits.unsqueeze(1), temperature=0.01).squeeze(1)
+
+        def emit_argmax_one_hot(step_logits: torch.Tensor) -> torch.Tensor:
+            # Deterministic argmax one-hot (no gradient) -- used for inference / when the
+            # decoder is excluded from the computation graph.
+            indices = torch.argmax(step_logits, dim=-1)
+            return F.one_hot(indices, num_classes=self.n_words).float()
+
+        def emit_gumbel_one_hot(step_logits: torch.Tensor) -> torch.Tensor:
+            # Differentiable hard one-hot via the Gumbel-Softmax trick.
+            return F.gumbel_softmax(step_logits, tau=1.0, hard=True)
+
+        def emit_straight_through_one_hot(step_logits: torch.Tensor) -> torch.Tensor:
+            # Argmax one-hot with a straight-through estimator for backprop.
+            probs = torch.softmax(step_logits, dim=-1)
             indices = torch.argmax(probs, dim=-1)
             one_hot = F.one_hot(indices, num_classes=self.n_words).float()
+            return (one_hot - probs).detach() + probs
 
-            return one_hot, None
+        # Select the per-step emission function, preserving the original branching logic.
+        if not get_actions_as_one_hot:
+            step_emit = emit_scaled_probs
+        elif deterministic_mode:  # in_inference_mode
+            step_emit = emit_argmax_one_hot if self.deterministic_inference else emit_gumbel_one_hot
+        elif exclude_decoder_from_computation_graph:
+            step_emit = emit_argmax_one_hot
+        elif self.use_gumble:
+            step_emit = emit_gumbel_one_hot
+        else:
+            step_emit = emit_straight_through_one_hot
 
-        def get_action_seq_as_one_hot_with_gumble(logits):
-            gumbel_softmax_sample = F.gumbel_softmax(
-                logits,
-                tau=1.0,
-                hard=True  # This returns a one-hot vector with gradients
-            )
+        # --- Autoregressive generation loop ---
+        generated_rows = []  # per-step emitted rows, each (batch, n_words)
+        idx = None           # integer tokens fed back to the Transformer (detached)
+        for _ in range(self.n_action_seq_length):
+            # logits: (batch, t + 1, n_words); the final position predicts the next token.
+            logits, _ = self.model.decoder(z, idx)
+            step_logits = logits[:, -1, :]
 
-            return gumbel_softmax_sample, None
+            row = step_emit(step_logits)
+            generated_rows.append(row)
 
+            # Condition the next step on the token we just produced (greedy w.r.t. the
+            # emitted row, detached so no gradient flows through the discrete choice).
+            next_token = torch.argmax(row, dim=-1, keepdim=True).detach()
+            idx = next_token if idx is None else torch.cat([idx, next_token], dim=1)
 
-        def get_action_seq_as_one_hot_with_straight_through_estimator(logits):
-            probs = self.model.decoder_last_layer(logits)
-            probs = probs.reshape(-1, self.n_action_seq_length, self.n_words)
-            # Deterministic argmax with straight-through estimator
-            indices = torch.argmax(probs, dim=-1)
-            one_hot = F.one_hot(indices, num_classes=self.n_words).float()
-
-            # Straight-through estimator for backpropagation
-            one_hot = (one_hot - probs).detach() + probs
-
-            return one_hot, None
-
-        logits = self.model.decoder(gen_input)
-        logits = logits.reshape(-1, self.n_action_seq_length, self.n_words)
+        sequence = torch.stack(generated_rows, dim=1)  # (batch, n_action_seq_length, n_words)
 
         if not get_actions_as_one_hot:
-            _, scaled_probs = get_action_seq_as_scaled_probs(logits)
-
-            return None, scaled_probs
-
-        # in_inference_mode: bool = not logits.requires_grad
-        in_inference_mode: bool = deterministic_mode
-
-        if in_inference_mode:
-            if self.deterministic_inference:
-                one_hot, _ = get_action_seq_deterministic_inference(logits)
-            else:
-                one_hot, _ = get_action_seq_as_one_hot_with_gumble(logits)
-
-            return one_hot, None
-        else:
-            if exclude_decoder_from_computation_graph:
-                one_hot, _ = get_action_seq_deterministic_inference(logits)
-            elif self.use_gumble:
-                one_hot, _ = get_action_seq_as_one_hot_with_gumble(logits)
-            else:
-                # Fallback to argmax with straight-through estimator
-                one_hot, _ = get_action_seq_as_one_hot_with_straight_through_estimator(logits)
-
-            return one_hot, None
+            return None, sequence
+        return sequence, None
 
     def run_forward_actions(self, current_env, act_list):
         state = None
