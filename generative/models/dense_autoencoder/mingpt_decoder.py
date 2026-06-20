@@ -182,6 +182,51 @@ class GPT(nn.Module):
 
         self.apply(self._init_weights)
 
+        # Loudly announce (once, at construction) that the minGPT Transformer decoder is
+        # in use -- so a run can be confirmed to be using this file and not the old MLP.
+        self._announce()
+
+    def _announce(self) -> None:
+        """Print a one-time banner and, if a wandb run is active, tag its config.
+
+        This is purely a diagnostic so you can verify from the logs / wandb that the
+        Transformer decoder (this file) is the one being instantiated.
+        """
+        cfg = self.config
+        n_params = sum(p.numel() for p in self.parameters())
+        print(
+            "\n==================== [GPS] DECODER = minGPT GPT ====================\n"
+            f"  mingpt_decoder.GPT active  |  trainable params = {n_params:,}\n"
+            f"  n_layer={cfg.n_layer}  n_head={cfg.n_head}  n_embd={cfg.n_embd}\n"
+            f"  vocab_size={cfg.vocab_size}  block_size={cfg.block_size}  "
+            f"decoder_input_size={cfg.decoder_input_size}\n"
+            "====================================================================\n",
+            flush=True,
+        )
+
+        # Best-effort: record in wandb if (and only if) a run is already active.
+        # Never let logging issues break model construction.
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.config.update(
+                    {
+                        "decoder_type": "mingpt_gpt",
+                        "decoder_n_params": n_params,
+                        "decoder_n_layer": cfg.n_layer,
+                        "decoder_n_head": cfg.n_head,
+                        "decoder_n_embd": cfg.n_embd,
+                        "decoder_vocab_size": cfg.vocab_size,
+                        "decoder_block_size": cfg.block_size,
+                        "decoder_input_size": cfg.decoder_input_size,
+                    },
+                    allow_val_change=True,
+                )
+                print("[GPS] tagged wandb run config with decoder_type=mingpt_gpt", flush=True)
+        except Exception as exc:  # pragma: no cover - diagnostics must never crash training
+            print(f"[GPS] (wandb tagging skipped: {exc})", flush=True)
+
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
         """GPT-style weight initialisation."""
