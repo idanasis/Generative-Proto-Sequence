@@ -45,8 +45,16 @@ class ActionGen:
             ``(None, scaled_probs)`` when ``get_actions_as_one_hot`` is False, else
             ``(one_hot, None)``. Both sequence tensors keep the historical shape
             ``(batch, n_action_seq_length, n_words)``.
+
+        ``gen_input`` may carry extra leading dimensions (e.g. a proto-plan candidates
+        axis, ``(batch, n_candidates, decoder_input_size)``). These are flattened into a
+        single batch dimension before decoding -- matching the old MLP decoder, whose
+        ``decoder(z).reshape(-1, seq_len, n_words)`` collapsed them the same way -- so the
+        returned tensor is ``(prod(leading_dims), n_action_seq_length, n_words)``.
         """
-        z = gen_input
+        # Collapse any leading dims into one batch dim (no-op when already 2-D); the GPT
+        # decoder expects z of shape (N, decoder_input_size).
+        z = gen_input.reshape(-1, gen_input.size(-1))
 
         def emit_scaled_probs(step_logits: torch.Tensor) -> torch.Tensor:
             # Temperature-scaled softmax over the vocabulary for a single step.
