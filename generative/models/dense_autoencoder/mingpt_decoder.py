@@ -84,38 +84,62 @@ class CausalSelfAttention(nn.Module):
         mask = torch.tril(torch.ones(max_len, max_len)).view(1, 1, max_len, max_len)
         self.register_buffer("causal_mask", mask, persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply masked self-attention.
+    def forward(
+        self,
+        x: torch.Tensor,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Apply masked self-attention, optionally with a key/value cache.
 
         Args:
-            x: Input of shape ``(B, T, n_embd)``.
+            x: Input of shape ``(B, Tq, n_embd)`` where ``Tq`` is the number of *new*
+                query positions -- the whole sequence in the non-cached case, or a single
+                token during incremental (cached) decoding.
+            layer_past: Optional ``(k, v)`` from earlier decoding steps, each
+                ``(B, n_head, T_past, head_dim)``; prepended to the current keys/values.
+            use_cache: If ``True`` also return the updated ``(k, v)`` for reuse.
 
         Returns:
-            Tensor of shape ``(B, T, n_embd)``.
+            ``(y, present)`` where ``y`` is ``(B, Tq, n_embd)`` and ``present`` is the
+            extended ``(k, v)`` cache (or ``None`` when ``use_cache`` is ``False``).
         """
-        B, T, C = x.size()  # batch, sequence length, embedding dim
+        B, Tq, C = x.size()  # batch, number of new query positions, embedding dim
 
-        # Project and split into query, key, value: each (B, T, C).
+        # Project and split into query, key, value for the new positions: each (B, Tq, C).
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
-        # Reshape into heads: (B, n_head, T, head_dim).
+        # Reshape into heads: (B, n_head, Tq, head_dim).
         head_dim = C // self.n_head
-        q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        q = q.view(B, Tq, self.n_head, head_dim).transpose(1, 2)
+        k = k.view(B, Tq, self.n_head, head_dim).transpose(1, 2)
+        v = v.view(B, Tq, self.n_head, head_dim).transpose(1, 2)
 
-        # Scaled dot-product attention with causal masking.
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))  # (B, nh, T, T)
-        att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
+        # Prepend cached keys/values from earlier decoding steps (KV cache).
+        if layer_past is not None:
+            past_k, past_v = layer_past
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        present = (k, v) if use_cache else None
+
+        # Scaled dot-product attention with causal masking. When the keys include cached
+        # positions (Tk > Tq), the Tq new queries occupy absolute rows [Tk - Tq, Tk);
+        # slicing the lower-triangular buffer this way lets each new query attend to every
+        # key up to and including its own position. For the full-sequence case Tk == Tq,
+        # this reduces to the usual [:T, :T] mask.
+        Tk = k.size(2)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))  # (B, nh, Tq, Tk)
+        att = att.masked_fill(self.causal_mask[:, :, Tk - Tq:Tk, :Tk] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
 
-        y = att @ v  # (B, nh, T, head_dim)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble heads
+        y = att @ v  # (B, nh, Tq, head_dim)
+        y = y.transpose(1, 2).contiguous().view(B, Tq, C)  # re-assemble heads
 
         # Output projection + residual dropout.
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, present
 
 
 class Block(nn.Module):
@@ -139,10 +163,16 @@ class Block(nn.Module):
             nn.Dropout(config.resid_pdrop),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        attn_out, present = self.attn(self.ln_1(x), layer_past=layer_past, use_cache=use_cache)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, present
 
 
 class GPT(nn.Module):
@@ -282,7 +312,7 @@ class GPT(nn.Module):
         x = self.drop(x + position_embeddings)
 
         for block in self.blocks:
-            x = block(x)
+            x, _ = block(x)  # no cache on the (parallel) teacher-forced path
         x = self.ln_f(x)
 
         logits = self.head(x)  # (B, T + 1, vocab_size)
@@ -300,6 +330,94 @@ class GPT(nn.Module):
 
         return logits, loss
 
+    # ------------------------------------------------------------------ #
+    # Cached incremental decoding (KV cache)
+    #
+    # The teacher-forced ``forward`` above processes the whole sequence in one parallel
+    # pass. Free-running generation instead needs one step per token; the helpers below
+    # keep a per-layer key/value cache so each step only computes the new token's
+    # attention instead of re-encoding the entire growing prefix (O(T) instead of O(T^2)).
+    # ------------------------------------------------------------------ #
+
+    def _forward_trunk(
+        self,
+        embeddings: torch.Tensor,
+        position_offset: int,
+        past_key_values: Optional[list] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[list]]:
+        """Run the Transformer trunk on a chunk of already-computed embeddings.
+
+        Args:
+            embeddings: ``(B, chunk_len, n_embd)`` prefix and/or token embeddings.
+            position_offset: absolute index of the first embedding (to slice ``pos_emb``).
+            past_key_values: optional list of per-layer ``(k, v)`` caches.
+            use_cache: whether to return the extended per-layer caches.
+
+        Returns:
+            ``(logits, presents)`` with logits ``(B, chunk_len, vocab_size)`` and
+            ``presents`` the updated cache list (or ``None``).
+        """
+        chunk_len = embeddings.size(1)
+        position_embeddings = self.pos_emb[:, position_offset:position_offset + chunk_len, :]
+        x = self.drop(embeddings + position_embeddings)
+
+        presents: Optional[list] = [] if use_cache else None
+        for i, block in enumerate(self.blocks):
+            layer_past = past_key_values[i] if past_key_values is not None else None
+            x, present = block(x, layer_past=layer_past, use_cache=use_cache)
+            if use_cache:
+                presents.append(present)
+
+        x = self.ln_f(x)
+        logits = self.head(x)
+        return logits, presents
+
+    def init_decode(
+        self, z: torch.Tensor, use_cache: bool = True
+    ) -> Tuple[torch.Tensor, Optional[list]]:
+        """Begin cached decoding: process the z-prefix and return the first-token logits.
+
+        Args:
+            z: Latent conditioning vector of shape ``(B, decoder_input_size)``.
+            use_cache: whether to build the key/value cache (set ``False`` to disable).
+
+        Returns:
+            ``(logits, past)`` with logits ``(B, vocab_size)`` predicting the first action
+            and ``past`` the initial per-layer cache.
+        """
+        prefix = self.z_proj(z).unsqueeze(1)  # (B, 1, n_embd) -- prefix at position 0
+        logits, past = self._forward_trunk(prefix, position_offset=0, use_cache=use_cache)
+        return logits[:, -1, :], past
+
+    def decode_step(
+        self,
+        tokens: torch.Tensor,
+        past_key_values: Optional[list],
+        position: int,
+        use_cache: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[list]]:
+        """Advance cached decoding by one token.
+
+        Args:
+            tokens: integer token ids ``(B,)`` or ``(B, 1)`` chosen at the previous step.
+            past_key_values: cache from the previous ``init_decode`` / ``decode_step``.
+            position: absolute position of ``tokens`` (prefix is at 0, so the first real
+                token is at position 1).
+            use_cache: whether to keep extending the cache.
+
+        Returns:
+            ``(logits, past)`` with logits ``(B, vocab_size)`` predicting the next token.
+        """
+        token_embeddings = self.tok_emb(tokens.view(-1, 1))  # (B, 1, n_embd)
+        logits, past = self._forward_trunk(
+            token_embeddings,
+            position_offset=position,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        return logits[:, -1, :], past
+
     @torch.no_grad()
     def generate(
         self,
@@ -309,10 +427,7 @@ class GPT(nn.Module):
         do_sample: bool = False,
         top_k: Optional[int] = None,
     ) -> torch.Tensor:
-        """Autoregressively sample a token sequence conditioned on ``z``.
-
-        Starting from the prefix token alone, repeatedly predict the next token and feed
-        it back in until ``max_new_tokens`` have been produced.
+        """Autoregressively sample a token sequence conditioned on ``z`` (KV-cached).
 
         Args:
             z: Latent conditioning vector of shape ``(B, decoder_input_size)``.
@@ -327,27 +442,26 @@ class GPT(nn.Module):
         if max_new_tokens is None:
             max_new_tokens = self.block_size
 
-        B = z.size(0)
-        idx = torch.empty((B, 0), dtype=torch.long, device=z.device)
+        # Process the z-prefix once; logits predict the first token.
+        logits, past = self.init_decode(z, use_cache=True)
 
-        for _ in range(max_new_tokens):
-            # Never exceed the model's context window.
-            idx_cond = idx[:, -self.block_size:] if idx.size(1) > 0 else None
-            logits, _ = self.forward(z, idx_cond)
-
-            # Take the logits at the final position to predict the next token.
-            logits = logits[:, -1, :] / temperature
+        generated = []
+        for step in range(max_new_tokens):
+            step_logits = logits / temperature
 
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float("-inf")
+                v, _ = torch.topk(step_logits, min(top_k, step_logits.size(-1)))
+                step_logits = step_logits.masked_fill(step_logits < v[:, [-1]], float("-inf"))
 
-            probs = F.softmax(logits, dim=-1)
+            probs = F.softmax(step_logits, dim=-1)
             if do_sample:
                 next_token = torch.multinomial(probs, num_samples=1)
             else:
                 next_token = torch.argmax(probs, dim=-1, keepdim=True)
 
-            idx = torch.cat([idx, next_token], dim=1)
+            generated.append(next_token)
+            if step < max_new_tokens - 1:
+                # The token just produced sits at absolute position ``step + 1``.
+                logits, past = self.decode_step(next_token, past, position=step + 1, use_cache=True)
 
-        return idx
+        return torch.cat(generated, dim=1)
