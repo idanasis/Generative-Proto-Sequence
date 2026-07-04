@@ -90,21 +90,25 @@ class ActionGen:
         else:
             step_emit = emit_straight_through_one_hot
 
-        # --- Autoregressive generation loop ---
+        # --- Autoregressive generation loop (KV-cached) ---
+        # init_decode processes the z-prefix once and returns both the logits predicting
+        # the first action and the key/value cache; each decode_step then feeds back only
+        # the newly chosen token, so attention over earlier positions is not recomputed
+        # (O(T) instead of O(T^2)). Gradients still reach z and the decoder params because
+        # the latent prefix (and the trunk) participate at every step.
         generated_rows = []  # per-step emitted rows, each (batch, n_words)
-        idx = None           # integer tokens fed back to the Transformer (detached)
-        for _ in range(self.n_action_seq_length):
-            # logits: (batch, t + 1, n_words); the final position predicts the next token.
-            logits, _ = self.model.decoder(z, idx)
-            step_logits = logits[:, -1, :]
-
+        step_logits, past = self.model.decoder.init_decode(z, use_cache=True)
+        for t in range(self.n_action_seq_length):
             row = step_emit(step_logits)
             generated_rows.append(row)
 
-            # Condition the next step on the token we just produced (greedy w.r.t. the
-            # emitted row, detached so no gradient flows through the discrete choice).
-            next_token = torch.argmax(row, dim=-1, keepdim=True).detach()
-            idx = next_token if idx is None else torch.cat([idx, next_token], dim=1)
+            if t < self.n_action_seq_length - 1:
+                # Condition the next step on the token we just produced (greedy w.r.t. the
+                # emitted row, detached so no gradient flows through the discrete choice).
+                next_token = torch.argmax(row, dim=-1).detach()  # (batch,)
+                step_logits, past = self.model.decoder.decode_step(
+                    next_token, past, position=t + 1, use_cache=True
+                )
 
         sequence = torch.stack(generated_rows, dim=1)  # (batch, n_action_seq_length, n_words)
 
