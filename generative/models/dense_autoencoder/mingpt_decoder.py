@@ -11,8 +11,10 @@ sequence -- a prefix conditioning token. Because attention is causal, every real
 can attend back to this prefix and thus to ``z``, which makes the whole sequence a
 function of the latent code, exactly as a VAE decoder requires.
 
-Architecture defaults are deliberately tiny (``n_layer=3``, ``n_head=4``, ``n_embd=64``)
-because our action sequences are short (length 10) and the vocabulary is small (5).
+Architecture defaults are deliberately tiny (``n_layer=2``, ``n_head=4``, ``n_embd=32``)
+because our action sequences are short (length 10), the vocabulary is small (5), and the
+decoder is trained from scratch through RL -- a smaller model is both faster and easier to
+optimise from sparse reward.
 """
 
 from __future__ import annotations
@@ -47,9 +49,9 @@ class GPTConfig:
     vocab_size: int = 5
     block_size: int = 10
     decoder_input_size: int = 16
-    n_layer: int = 3
+    n_layer: int = 2
     n_head: int = 4
-    n_embd: int = 64
+    n_embd: int = 32
     embd_pdrop: float = 0.1
     resid_pdrop: float = 0.1
     attn_pdrop: float = 0.1
@@ -211,6 +213,20 @@ class GPT(nn.Module):
         self.head: nn.Linear = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         self.apply(self._init_weights)
+
+        # --- Conditioning-aware init overrides (applied after the generic init) ---
+        # 1. Position embeddings: the generic _init_weights does not touch nn.Parameter,
+        #    so pos_emb would otherwise stay all-zeros. Give it the standard small-random
+        #    init (as GPT-2 does) so positions are distinguishable from step 0.
+        nn.init.normal_(self.pos_emb, mean=0.0, std=0.02)
+
+        # 2. Latent projection: initialise z_proj much larger than the 0.02-scale trunk so
+        #    the z-prefix *dominates the (un-normalised) residual stream* at init -- i.e. z
+        #    actually drives the decoder's outputs from the first step instead of being
+        #    swamped by the near-random trunk. std = 1/sqrt(decoder_input_size) makes the
+        #    prefix roughly unit-variance (~10x the rest). This scale is a tunable knob.
+        nn.init.normal_(self.z_proj.weight, mean=0.0, std=1.0 / math.sqrt(config.decoder_input_size))
+        nn.init.zeros_(self.z_proj.bias)
 
         # Loudly announce (once, at construction) that the minGPT Transformer decoder is
         # in use -- so a run can be confirmed to be using this file and not the old MLP.
