@@ -1,8 +1,23 @@
 #!/bin/bash
+# Production baseline, non-deterministic variant of run_gps.sbatch.
+#
+# Identical in every other respect, so this pair measures the cost of determinism at full
+# scale. Measured at 30k steps on gtx_1080: 19.67h -> 11.52h with evaluation off (E1 vs
+# E5), a 1.71x penalty. The cause is not the convolutions -- profiling put conv2d at 1.2%
+# of the loop -- but cuBLAS: CUBLAS_WORKSPACE_CONFIG=:4096:8 exists purely to satisfy
+# torch.use_deterministic_algorithms, and torch._C._nn.linear is ~30% of the training
+# loop. Note the deliberate absence of that export below.
+#
+# Expected ~9h here versus ~15h for the deterministic run.
+#
+# The trade is exact run-to-run reproducibility. Results should still be statistically
+# equivalent -- if the two runs' success rates differ noticeably, that is seed noise
+# between two different RNG streams, not evidence that determinism affects learning.
+#
 #SBATCH --partition=main
-#SBATCH --time=0-48:00:00 
-#SBATCH --job-name=gps_mingpt_maze
-#SBATCH --output=gps_maze_job-%J.out
+#SBATCH --time=0-48:00:00
+#SBATCH --job-name=gps_mingpt_maze_nondet
+#SBATCH --output=gps_maze_nondet_job-%J.out
 # Pin the GPU type. The partition is heterogeneous (gtx_1080, rtx_2080, rtx_3090) and a
 # bare --gpus=1 will happily hand out a 2080 Ti, which makes the runtime incomparable to
 # the 10.4h MLP baseline (job 18136376, cs-1080-02, gtx_1080).
@@ -16,7 +31,7 @@ source activate gps_env
 
 # Bypass the interactive login by setting the key directly
 export WANDB_API_KEY="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"
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
+# No CUBLAS_WORKSPACE_CONFIG here -- it is only needed for deterministic cuBLAS.
 
 START=$(date +%s)
 
@@ -24,6 +39,7 @@ START=$(date +%s)
 poetry run python gps_simplegrid_levels.py \
     --cuda \
     --track \
+    --no-torch_deterministic \
     --obstacle_map 16x16_corridors_v1 \
     --train_dataset_size 100 \
     --val_dataset_size 100 \
@@ -37,10 +53,3 @@ poetry run python gps_simplegrid_levels.py \
 END=$(date +%s)
 echo "WALL_CLOCK_SECONDS=$((END - START))"
 echo "WALL_CLOCK_HOURS=$(awk "BEGIN {printf \"%.2f\", ($END - $START)/3600}")"
-
-# --decoder_use_cuda_graph                   measured 30.54h -> 15.27h (E3 vs E8)
-# --eval_test_dataset_during_training_freq   the periodic test-set evaluations feed no
-#     model selection and no training signal -- only logging. The final test evaluation at
-#     the end of train() still runs, so the headline accuracy number is unaffected.
-# --slurm_job_id                             lands in wandb.config, so a run can be found
-#     by job id instead of grepping logs for its wandb URL.
