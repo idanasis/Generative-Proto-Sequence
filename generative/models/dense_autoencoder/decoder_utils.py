@@ -255,10 +255,14 @@ class ActionGen:
 
 def get_decoder_api(decoder_model_path: str, decoder_seq_len: int, device: torch.device, maze_n_actions: int = 4,
                     var_for_sample: int = 1, use_gumble_in_decoder: bool = True, penalize_cyclic_position_revisits: bool = False,
-                    deterministic_inference: bool = False, load_pretrained_weights: bool = True) -> ActionGen:
+                    deterministic_inference: bool = False, load_pretrained_weights: bool = True,
+                    decoder_n_layer: int = 2, decoder_n_head: int = 4, decoder_n_embd: int = 32,
+                    decoder_dropout: Optional[float] = None) -> ActionGen:
     decoder = get_decoder(decoder_f_name=decoder_model_path, decoder_seq_len=decoder_seq_len, device=device,
-                          maze_n_actions=maze_n_actions, var_for_sample=var_for_sample, 
-                          load_pretrained_weights=load_pretrained_weights)
+                          maze_n_actions=maze_n_actions, var_for_sample=var_for_sample,
+                          load_pretrained_weights=load_pretrained_weights,
+                          decoder_n_layer=decoder_n_layer, decoder_n_head=decoder_n_head,
+                          decoder_n_embd=decoder_n_embd, decoder_dropout=decoder_dropout)
     return ActionGen(pretrained_decoder=decoder, n_act_seq_len=decoder_seq_len, device=device,
                      maze_n_actions=maze_n_actions, use_gumble=use_gumble_in_decoder,
                      penalize_cyclic_position_revisits=penalize_cyclic_position_revisits,
@@ -266,9 +270,13 @@ def get_decoder_api(decoder_model_path: str, decoder_seq_len: int, device: torch
 
 
 def get_decoder(decoder_f_name: str, decoder_seq_len: int, device: torch.device, maze_n_actions: int,
-                var_for_sample: int = 1, load_pretrained_weights: bool = True):
+                var_for_sample: int = 1, load_pretrained_weights: bool = True,
+                decoder_n_layer: int = 2, decoder_n_head: int = 4, decoder_n_embd: int = 32,
+                decoder_dropout: Optional[float] = None):
     decoder = DenseVAE(input_length=decoder_seq_len, n_words=maze_n_actions + 1, device=device,
-                       variance_for_sample=var_for_sample).to(device)
+                       variance_for_sample=var_for_sample,
+                       decoder_n_layer=decoder_n_layer, decoder_n_head=decoder_n_head,
+                       decoder_n_embd=decoder_n_embd, decoder_dropout=decoder_dropout).to(device)
     if load_pretrained_weights:
         # Load state dict directly to the correct device
         decoder.load_state_dict(torch.load(decoder_f_name, map_location=device))

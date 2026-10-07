@@ -3,7 +3,7 @@ import os
 import pickle
 import random
 from collections import defaultdict, Counter
-from typing import List, Union, Tuple
+from typing import List, Optional, Union, Tuple
 
 import numpy as np
 import pandas as pd
@@ -55,7 +55,18 @@ class TensorCache:
 
 class DenseVAE(nn.Module):
     def __init__(self, input_length: int, n_words: int, device: torch.device,
-                 variance_for_sample: int = 1, decoder_input_size: int = 16):
+                 variance_for_sample: int = 1, decoder_input_size: int = 16,
+                 decoder_n_layer: int = 2, decoder_n_head: int = 4, decoder_n_embd: int = 32,
+                 decoder_dropout: Optional[float] = None):
+        """
+        Args:
+            decoder_n_layer / decoder_n_head / decoder_n_embd: size of the Transformer
+                decoder trunk. Exposed so the shape can be swept from the command line --
+                the autoregressive decode loop costs one trunk pass per token, so n_layer
+                is close to a linear knob on decoder wall-clock time.
+            decoder_dropout: if given, overrides all three GPT dropout rates at once.
+                ``None`` keeps minGPT's own defaults.
+        """
         super().__init__()
         self.decoder_input_size = decoder_input_size
         self.device = device
@@ -86,11 +97,21 @@ class DenseVAE(nn.Module):
         # Decoder: a small causal Transformer conditioned on the latent z (replaces the
         # previous MLP). z is projected to a prefix token and the action sequence is
         # generated autoregressively. block_size == input_length, vocab_size == n_words.
-        self.gpt_config = GPTConfig(
+        gpt_kwargs = dict(
             vocab_size=n_words,
             block_size=input_length,
             decoder_input_size=decoder_input_size,
+            n_layer=decoder_n_layer,
+            n_head=decoder_n_head,
+            n_embd=decoder_n_embd,
         )
+        if decoder_dropout is not None:
+            gpt_kwargs.update(
+                embd_pdrop=decoder_dropout,
+                resid_pdrop=decoder_dropout,
+                attn_pdrop=decoder_dropout,
+            )
+        self.gpt_config = GPTConfig(**gpt_kwargs)
         self.decoder = GPT(self.gpt_config)
 
     def _init_weights(self, module):

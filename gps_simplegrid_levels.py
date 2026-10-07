@@ -270,6 +270,19 @@ class Config:
     """model path of pretrained VAE decoder"""
     n_actions_in_seq: int = 10
     """the number of actions in the decoder output"""
+    decoder_n_layer: int = 2
+    """number of Transformer blocks in the minGPT decoder trunk. The decoder is run
+       autoregressively (one trunk pass per generated token), so this is close to a linear
+       knob on decoder wall-clock cost"""
+    decoder_n_head: int = 4
+    """number of attention heads in the minGPT decoder (must divide decoder_n_embd)"""
+    decoder_n_embd: int = 32
+    """embedding / hidden width of the minGPT decoder"""
+    decoder_dropout: float = 0.0
+    """dropout rate applied to the minGPT decoder's embeddings, attention and residuals.
+       Defaults to 0 to match the old MLP decoder, which had no dropout at all: any
+       non-zero value adds noise to generated action sequences on every path where the
+       decoder is in train mode"""
     use_gumble_in_decoder: bool = True
     """
     If True, the decoder's `gen_action_seq` function uses the Gumbel-Softmax method, which preserves gradients for backpropagation.
@@ -478,6 +491,13 @@ def eval_model(
     if critic is not None:
         critic.eval()
 
+    # The decoder must be evaluated deterministically too. The old MLP decoder had no
+    # dropout layers, so its train/eval mode was a no-op and nothing here ever set it;
+    # the Transformer decoder does have dropout, and leaving it in train mode injects
+    # noise into every generated sequence at evaluation time.
+    decoder_was_training = decoder.model.training
+    decoder.model.eval()
+
     eval_episodes = len(dataset)
 
     obs, obs_info = envs.reset()
@@ -659,6 +679,9 @@ def eval_model(
         obs = next_obs
 
     envs.close()
+
+    if decoder_was_training:
+        decoder.model.train()
 
     if verbose_stats:
         return np.asarray(episodic_returns), np.asarray(episodic_successes), np.asarray(episodic_num_decoder_generations), \
@@ -1595,7 +1618,9 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
     load_pretrained_decoder = cfg.initialize_decoder_from_pretrained or not cfg.train_decoder_end_to_end
     decoder = get_decoder_api(decoder_model_path=cfg.decoder_model_path, decoder_seq_len=cfg.n_actions_in_seq, device=device, maze_n_actions=4,
                               use_gumble_in_decoder=cfg.use_gumble_in_decoder, penalize_cyclic_position_revisits=cfg.penalize_cyclic_position_revisits,
-                              deterministic_inference=cfg.deterministic_inference, load_pretrained_weights=load_pretrained_decoder)
+                              deterministic_inference=cfg.deterministic_inference, load_pretrained_weights=load_pretrained_decoder,
+                              decoder_n_layer=cfg.decoder_n_layer, decoder_n_head=cfg.decoder_n_head,
+                              decoder_n_embd=cfg.decoder_n_embd, decoder_dropout=cfg.decoder_dropout)
     
     # Set decoder to training mode if training end-to-end
     if cfg.train_decoder_end_to_end:
@@ -2066,6 +2091,12 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                         actor_weights = copy.deepcopy(actor_network.state_dict())
 
                     actor_optimizer.zero_grad()
+                    # The decoder sits inside the actor's computation graph when training
+                    # end-to-end, so its gradients must be cleared on the same schedule as
+                    # the actor's -- otherwise every backward adds to the previous ones and
+                    # the optimizer steps along a running sum instead of the current grad.
+                    if cfg.train_decoder_end_to_end:
+                        decoder_optimizer.zero_grad()
                     actor_loss.backward()
 
                     # Gradient monitoring
