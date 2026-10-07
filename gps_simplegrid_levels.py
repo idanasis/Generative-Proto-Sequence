@@ -283,6 +283,12 @@ class Config:
        Defaults to 0 to match the old MLP decoder, which had no dropout at all: any
        non-zero value adds noise to generated action sequences on every path where the
        decoder is in train mode"""
+    decoder_use_cuda_graph: bool = False
+    """replay the decoder's autoregressive decode loop from a captured CUDA graph on the
+       gradient-free paths (action selection, target-Q, evaluation). The loop issues ~550
+       tiny kernels per call and is almost entirely dispatch overhead, so this is worth
+       ~8x at batch 1 and ~2x at batch 256. The actor update stays eager so gradients
+       still flow. Requires CUDA; falls back to eager with a warning if capture fails"""
     use_gumble_in_decoder: bool = True
     """
     If True, the decoder's `gen_action_seq` function uses the Gumbel-Softmax method, which preserves gradients for backpropagation.
@@ -1620,7 +1626,8 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                               use_gumble_in_decoder=cfg.use_gumble_in_decoder, penalize_cyclic_position_revisits=cfg.penalize_cyclic_position_revisits,
                               deterministic_inference=cfg.deterministic_inference, load_pretrained_weights=load_pretrained_decoder,
                               decoder_n_layer=cfg.decoder_n_layer, decoder_n_head=cfg.decoder_n_head,
-                              decoder_n_embd=cfg.decoder_n_embd, decoder_dropout=cfg.decoder_dropout)
+                              decoder_n_embd=cfg.decoder_n_embd, decoder_dropout=cfg.decoder_dropout,
+                              decoder_use_cuda_graph=cfg.decoder_use_cuda_graph)
     
     # Set decoder to training mode if training end-to-end
     if cfg.train_decoder_end_to_end:
