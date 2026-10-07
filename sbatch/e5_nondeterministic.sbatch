@@ -14,7 +14,9 @@
 #SBATCH --time=0-04:00:00
 #SBATCH --job-name=e5_nondet
 #SBATCH --output=sbatch/logs/e5_nondeterministic-%J.out
-#SBATCH --gpus=1
+# Pin the GPU type: the partition is heterogeneous (gtx_1080, rtx_2080, rtx_3090) and
+# the 10.4h baseline ran on gtx_1080, so comparisons must stay on that class.
+#SBATCH --gpus=gtx_1080:1
 #SBATCH --mem=24G
 #SBATCH --cpus-per-task=4
 
