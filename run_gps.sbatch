@@ -3,7 +3,10 @@
 #SBATCH --time=0-48:00:00 
 #SBATCH --job-name=gps_mingpt_maze
 #SBATCH --output=gps_maze_job-%J.out
-#SBATCH --gpus=1
+# Pin the GPU type. The partition is heterogeneous (gtx_1080, rtx_2080, rtx_3090) and a
+# bare --gpus=1 will happily hand out a 2080 Ti, which makes the runtime incomparable to
+# the 10.4h MLP baseline (job 18136376, cs-1080-02, gtx_1080).
+#SBATCH --gpus=gtx_1080:1
 #SBATCH --mem=24G
 #SBATCH --cpus-per-task=4
 
@@ -23,4 +26,14 @@ poetry run python gps_simplegrid_levels.py \
     --val_dataset_size 100 \
     --test_dataset_size 1000 \
     --train_decoder_end_to_end \
-    --no-initialize_decoder_from_pretrained
+    --no-initialize_decoder_from_pretrained \
+    --decoder_use_cuda_graph \
+    --eval_test_dataset_during_training_freq -1 \
+    --slurm_job_id "${SLURM_JOB_ID}"
+
+# --decoder_use_cuda_graph                   measured 30.54h -> 15.27h (E3 vs E8)
+# --eval_test_dataset_during_training_freq   the periodic test-set evaluations feed no
+#     model selection and no training signal -- only logging. The final test evaluation at
+#     the end of train() still runs, so the headline accuracy number is unaffected.
+# --slurm_job_id                             lands in wandb.config, so a run can be found
+#     by job id instead of grepping logs for its wandb URL.
