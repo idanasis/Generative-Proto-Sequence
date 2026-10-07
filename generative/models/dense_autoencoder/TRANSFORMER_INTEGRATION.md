@@ -8,6 +8,7 @@ Files touched:
 - **New:** [mingpt_decoder.py](mingpt_decoder.py)
 - **Changed:** [dense_var_auto_encoder_vin_1.py](dense_var_auto_encoder_vin_1.py)
 - **Changed:** [decoder_utils.py](decoder_utils.py)
+- **Changed:** [gps_simplegrid_levels.py](../../../gps_simplegrid_levels.py) (§7)
 
 ---
 
@@ -290,3 +291,177 @@ parameters were mis-initialised. Two overrides applied **after** `self.apply(_in
 - **Open:** a post-shrink/-init GPT run has not yet been measured — that's the test of whether
   §6.3–6.4 close the gap toward ~0.79. If it plateaus below target, the next lever is
   **reconstruction pretraining** (which also needs the §4.1–4.3 standalone-loop fixes).
+- **Superseded by §7:** the ~0.385 figure above was measured while two E2E training bugs
+  (§7.1) were active, so it does not measure the architecture. It needs re-measuring.
+
+---
+
+## 7. Runtime investigation + E2E correctness fixes (round 2)
+
+Prompted by runtime: the MLP baseline completed in **10:24:26** (slurm 18136376, `cs-1080-02`,
+`gtx_1080`) while the GPT run took **2-02:19:29** (slurm 19543017, same GPU class) — a 4.8×
+regression. Investigation found the regression was only partly the Transformer; two bugs were
+amplifying it and simultaneously preventing the decoder from training.
+
+### 7.1 Two bugs in the E2E path  (`gps_simplegrid_levels.py`)
+
+Both are specific to `--train_decoder_end_to_end`, and both were invisible with the old MLP
+decoder — which is why they appeared only after the Transformer landed.
+
+#### 7.1.1 `decoder_optimizer.zero_grad()` was never called
+
+`critic_optimizer.zero_grad()` and `actor_optimizer.zero_grad()` were both present; the
+decoder optimizer only ever received `.step()`. Because the decoder sits inside the actor's
+computation graph, its gradients **accumulated across every actor update for the whole run** —
+by step N the optimizer was stepping along the sum of N/4 gradients rather than the current
+one. Adam normalises the magnitude, so this never produced a NaN or a crash; it silently
+pointed the decoder in the wrong direction.
+
+**Fix:** clear the decoder's gradients on the same schedule as the actor's.
+
+**Verified:** decoder gradient norm now reads 1.0 → 16.7 over 30k steps. Accumulation would
+have put it in the hundreds or thousands (7,500 summed updates at that point).
+
+#### 7.1.2 The decoder never left `train()` mode
+
+`decoder.model.to(device).train()` is set for E2E mode and nothing ever set it back.
+`eval_model` put the *actor* and *critic* into eval mode but not the decoder. The old MLP
+decoder had **no dropout layers at all**, so its train/eval mode was a no-op and nobody
+noticed; minGPT has three (`embd_pdrop`, `attn_pdrop`, `resid_pdrop`, all 0.1), which were
+therefore **injecting noise into every generated sequence** during action selection, the
+target-Q computation, and all evaluation.
+
+**Fix:** two parts —
+- `eval_model` saves/restores the decoder's training flag and calls `.eval()`.
+- New `--decoder_dropout` (**default 0.0**) matches the old MLP's behaviour, which also
+  covers the rollout and target-Q paths that `eval_model` does not touch. Pass `0.1` to
+  restore the previous behaviour.
+
+#### Combined effect on runtime
+
+A noisy/mis-trained decoder emits sequences that trim to length 1, so the agent makes far
+more decisions per episode. `num_decoder_generations` saturates toward `max_episode_steps`
+(75) instead of ~20, which multiplies the **evaluation** term — the largest single cost in a
+production run — by roughly 10×. The bugs were both a correctness problem and the bulk of the
+runtime regression.
+
+### 7.2 Measurements
+
+All on **GTX 1080 Ti (sm_61)**, torch 2.2.1+cu121, via `bench_decoder.py` and `sbatch/e*.sbatch`.
+
+**Per call** (ms), `bench_decoder.py`:
+
+| decoder | fwd b=1 | fwd b=256 | fwd+bwd b=256 |
+|---|---|---|---|
+| MLP (legacy, 1 pass) | 0.469 | 0.493 | 1.213 |
+| GPT eager `L=2 embd=32` | 10.478 | 10.921 | 29.954 |
+| GPT eager `L=1 embd=32` | 7.165 | 7.525 | 19.722 |
+| GPT eager `L=1 embd=16` | 7.325 | 7.351 | 22.886 |
+| **GPT cuda-graph** `L=2` | **1.228** | **5.051** | n/a (forward only) |
+| GPT on CPU (+transfers) | 10.686 | 37.360 | n/a |
+
+**The decoder is ~100% dispatch overhead, not arithmetic.** Three independent confirmations:
+batch 1 and batch 256 cost the same to within 1%; `embd` 32→16 is 3.5× fewer params and no
+faster; cost fits `3.73 ms + 3.91 ms × n_layer`, so even a 0-layer trunk would cost 7× the
+entire old decoder — that constant is the 10-iteration Python loop itself.
+
+**End-to-end** (30k steps, projected to 1M):
+
+| run | config | projected |
+|---|---|---|
+| E1 | eval off, deterministic, eager | 19.67 h |
+| E3 | eval on @5000, deterministic, eager | **30.54 h** |
+| E5 | eval off, **non-deterministic**, eager | 11.52 h |
+| E8 | eval on @5000, deterministic, **cuda graph** | **15.27 h** |
+
+- **Evaluation costs 10.87 h** (E3 − E1) — 36% of a production run.
+- **Determinism costs 8.15 h** (E1 − E5), a 1.71× penalty. Not the convolutions (`conv2d` is
+  1.2% of the loop) but **cuBLAS**: `CUBLAS_WORKSPACE_CONFIG=:4096:8` exists only to satisfy
+  `torch.use_deterministic_algorithms`, and `torch._C._nn.linear` is ~30% of the loop.
+- **The CUDA graph halves the run** (E3 − E8, exactly 2.0×).
+
+**Profile** (`cProfile`, 3k steps, `sbatch/e6_profile_trainloop.sbatch`): `_forward_trunk`
+cumtime **120.96 s of 241.11 s — ~50% of the training loop is the decode loop**.
+`torch._C._nn.linear` is 555,271 calls / 73.49 s, of which ~508k (91%) are the decoder
+(56,450 trunk passes × 9 linears).
+
+### 7.3 Performance changes
+
+#### 7.3.1 Fused attention  (`mingpt_decoder.py`)
+
+`CausalSelfAttention.forward` replaces the matmul / scale / `masked_fill` / softmax / dropout
+/ matmul chain with one `F.scaled_dot_product_attention`. The causal mask buffer is now
+`torch.bool` (what SDPA wants, no per-call conversion), and when `Tq == 1` — every cached
+`decode_step` — the single query sits at the last position, so **every key is already in its
+past and no mask is passed at all**. Mathematically identical.
+
+Note: on sm_61 with fp32, flash is unavailable and this likely dispatches to the math
+backend, so the win here is small on *this* hardware. It should matter on sm_75+.
+
+#### 7.3.2 CUDA graph for the gradient-free decode paths  (`decoder_utils.py`)
+
+`gen_action_seq`'s loop is extracted into `_generate(z, step_emit)`, so one code path serves
+both eager and captured execution. `_generate_graphed` caches graphs keyed by
+`(batch_size, emit_mode)`; enabled by **`--decoder_use_cuda_graph`** (default off).
+
+The switch is **`torch.is_grad_enabled()`**, not a call-site flag: grad is off for action
+selection, target-Q and evaluation — nearly all the calls — and on for the actor update,
+which stays eager so gradients still reach `z` and the decoder parameters.
+
+Three properties make this safe inside a *training* loop:
+
+- **Weights stay live.** The graph holds pointers to parameter tensors and Adam mutates
+  `param.data` in place, so replays see current weights. ⚠️ `handle_nan_weights`
+  (`gps_simplegrid_levels.py`) does `param.data = torch.randn_like(...)`, which **rebinds** and
+  would silently invalidate every captured graph. It is currently dead code — if it is ever
+  wired up, the graph cache must be cleared alongside it.
+- **The output is cloned.** A graph writes into a fixed buffer that the next replay
+  overwrites, and the training loop re-reads `action_list_batch` after stepping the
+  environment. Returning the live buffer would be silent data corruption.
+- **Capture failure degrades, not crashes.** One warning, `use_cuda_graph = False`, continue
+  eager — a 15-hour job should not die on an unsupported op.
+
+**Verified (E8 vs E3, identical config, graph the only difference):** exactly three captures
+and no fallback — `(256, gumbel)` target-Q, `(1, gumbel)` action selection, `(1, argmax)`
+eval. Success rate 0.27 → 0.25 (within the ±0.044 standard error of a 100-episode val set);
+valid actions/sequence 1.237 → 1.408; decoder generations 19.963 → 17.84. No corruption.
+
+#### 7.3.3 Decoder shape + dropout as CLI flags
+
+`--decoder_n_layer`, `--decoder_n_head`, `--decoder_n_embd`, `--decoder_dropout`, plumbed
+`Config` → `get_decoder_api` → `get_decoder` → `DenseVAE` → `GPTConfig`. Defaults match the
+previously hardcoded values, so nothing changes unless passed. Added so §7.2's sweeps needed
+no file edits between runs.
+
+### 7.4 Ruled out
+
+| candidate | result |
+|---|---|
+| `torch.compile(mode="reduce-overhead")` | **Fails on sm_61**: `Triton only supports devices of CUDA Capability >= 7.0`. Untested on sm_75+, where it could also graph the *backward* pass that §7.3.2 leaves eager. |
+| Decoder on CPU | No better at b=1, **3.4× worse** at b=256. |
+| Shrinking the model | `embd` 32→16 gains 1.6%. The cost is not arithmetic. |
+| Faster GPU | RTX 2080 Ti vs GTX 1080 Ti, same script: 10.73 h vs 11.52 h — **7%**. Dispatch overhead is CPU-side; GPU FLOPS are nearly irrelevant. |
+| Replay-buffer sampling | Hypothesised that `random.sample` over a `deque` (O(n) indexing, ~12.5k hops × 256 draws per step) was significant. **Wrong** — all `deque` ops total ~0.02 s. |
+| `TensorCache` on `trim_action_sequence_from_eos_tokens` | Real but minor: its key is `tuple(actions.tolist())`, forcing a GPU→CPU sync per call, ~4% of the loop — the key costs more than the ops it caches. **Not applied** (also an aliasing hazard: the function mutates `actions` in place, so a cached tensor lets one caller's edit surface in another's result). |
+| Gradient-monitoring block | 103,736 `.item()` calls / 2.47 s (~1%) every 250 steps. **Not applied.** |
+
+### 7.5 Status
+
+Production config is `run_gps.sbatch` (deterministic, ~15 h) and `run_gps_nondet.sbatch`
+(~9 h). Both pin **`--gpus=gtx_1080:1`** — the partition is heterogeneous (`gtx_1080`,
+`rtx_2080`, `rtx_3090`) and a bare `--gpus=1` silently hands out other hardware, which makes
+runtime incomparable to the 10.4 h MLP baseline. Both enable `--decoder_use_cuda_graph` and
+disable the periodic test-set evaluations (`--eval_test_dataset_during_training_freq -1`),
+which feed no model selection and no training signal — only logging. Verified: of the three
+evaluation sites, **only the val evaluation ever saves a checkpoint**.
+
+**Runtime: resolved.** 50.3 h → ~15 h deterministic, ~9 h non-deterministic, against a 10.4 h
+MLP baseline on the same GPU class.
+
+**Accuracy: open, and not addressed by any of the above.** §7.3 is mathematically neutral;
+§7.1 is what should move the number. The §6.5 comparison (GPT ~0.385 vs MLP ~0.794) was
+measured with both bugs active and must be re-run before it means anything.
+
+For calibration when reading the new runs: at 30k steps (3% of a run) E3/E8 reached 0.25–0.27
+val success with 1.24–1.41 valid actions per sequence. Per §6.5's own recalibration, ~1.6 is
+normal for this task even for the 0.794 MLP, so short sequences are **not** a collapse signal.
