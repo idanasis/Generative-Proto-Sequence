@@ -73,8 +73,9 @@ class CausalSelfAttention(nn.Module):
         # Output projection applied after attention.
         self.c_proj: nn.Linear = nn.Linear(config.n_embd, config.n_embd)
 
-        # Regularisation.
-        self.attn_dropout: nn.Dropout = nn.Dropout(config.attn_pdrop)
+        # Regularisation. Attention dropout is applied inside the fused SDPA kernel (see
+        # ``forward``) rather than by a separate nn.Dropout module.
+        self.attn_pdrop: float = config.attn_pdrop
         self.resid_dropout: nn.Dropout = nn.Dropout(config.resid_pdrop)
 
         self.n_head: int = config.n_head
@@ -82,8 +83,10 @@ class CausalSelfAttention(nn.Module):
 
         # Causal mask of shape (1, 1, T, T) where T = block_size + 1 (prefix token).
         # Registered as a buffer so it moves with ``.to(device)`` but is not a parameter.
+        # Stored as bool, which is what scaled_dot_product_attention wants, so no dtype
+        # conversion is needed on the hot path.
         max_len = config.block_size + 1
-        mask = torch.tril(torch.ones(max_len, max_len)).view(1, 1, max_len, max_len)
+        mask = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool)).view(1, 1, max_len, max_len)
         self.register_buffer("causal_mask", mask, persistent=False)
 
     def forward(
@@ -125,18 +128,25 @@ class CausalSelfAttention(nn.Module):
 
         present = (k, v) if use_cache else None
 
-        # Scaled dot-product attention with causal masking. When the keys include cached
-        # positions (Tk > Tq), the Tq new queries occupy absolute rows [Tk - Tq, Tk);
-        # slicing the lower-triangular buffer this way lets each new query attend to every
-        # key up to and including its own position. For the full-sequence case Tk == Tq,
-        # this reduces to the usual [:T, :T] mask.
+        # Scaled dot-product attention with causal masking, as a single fused kernel
+        # instead of the matmul / scale / masked_fill / softmax / dropout / matmul chain.
+        # At our sizes (n_embd=32, seq<=11) every one of those was launch-latency bound,
+        # so collapsing them matters far more than the arithmetic does.
+        #
+        # When the keys include cached positions (Tk > Tq), the Tq new queries occupy
+        # absolute rows [Tk - Tq, Tk); slicing the lower-triangular buffer this way lets
+        # each new query attend to every key up to and including its own position. For the
+        # full-sequence case Tk == Tq this reduces to the usual [:T, :T] mask. In the
+        # single-token decode step (Tq == 1) the one query sits at the last position, so
+        # every key is already in its past and no mask is needed at all.
         Tk = k.size(2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))  # (B, nh, Tq, Tk)
-        att = att.masked_fill(self.causal_mask[:, :, Tk - Tq:Tk, :Tk] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
+        attn_mask = None if Tq == 1 else self.causal_mask[:, :, Tk - Tq:Tk, :Tk]
 
-        y = att @ v  # (B, nh, Tq, head_dim)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_pdrop if self.training else 0.0,
+        )  # (B, nh, Tq, head_dim)
         y = y.transpose(1, 2).contiguous().view(B, Tq, C)  # re-assemble heads
 
         # Output projection + residual dropout.
