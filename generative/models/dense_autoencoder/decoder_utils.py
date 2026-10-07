@@ -10,7 +10,7 @@ class ActionGen:
 
     def __init__(self, pretrained_decoder: DenseVAE, n_act_seq_len: int, device: torch.device, maze_n_actions: int = 4,
                  use_gumble: bool = True, penalize_cyclic_position_revisits: bool = False,
-                 deterministic_inference: bool = True):
+                 deterministic_inference: bool = True, use_cuda_graph: bool = False):
         self.n_words = maze_n_actions + 1
         self.n_action_seq_length = n_act_seq_len
         self.model = pretrained_decoder
@@ -19,6 +19,15 @@ class ActionGen:
         self.use_gumble = use_gumble
         self.penalize_cyclic_position_revisits = penalize_cyclic_position_revisits
         self.deterministic_inference = deterministic_inference
+
+        # CUDA graph capture for the gradient-free decode paths. The autoregressive loop
+        # issues ~550 tiny kernels per call and is ~100% dispatch overhead at our sizes
+        # (measured: batch 1 and batch 256 cost the same to within 1%), so replaying it as
+        # a single captured graph is worth ~8x at batch 1 and ~2x at batch 256.
+        self.use_cuda_graph = use_cuda_graph
+        # Keyed by (batch_size, emit mode): the training loop only uses a handful of
+        # shapes, and a graph is bound to exactly one.
+        self._graph_cache: dict = {}
 
     @staticmethod
     def temperature_scaled_softmax(logits, temperature=1.0):
@@ -79,23 +88,46 @@ class ActionGen:
             return (one_hot - probs).detach() + probs
 
         # Select the per-step emission function, preserving the original branching logic.
+        # ``emit_key`` identifies the choice so that captured graphs are not shared between
+        # emission modes (an argmax graph would silently serve the gumbel call sites).
         if not get_actions_as_one_hot:
-            step_emit = emit_scaled_probs
+            step_emit, emit_key = emit_scaled_probs, "scaled_probs"
         elif deterministic_mode:  # in_inference_mode
-            step_emit = emit_argmax_one_hot if self.deterministic_inference else emit_gumbel_one_hot
+            if self.deterministic_inference:
+                step_emit, emit_key = emit_argmax_one_hot, "argmax"
+            else:
+                step_emit, emit_key = emit_gumbel_one_hot, "gumbel"
         elif exclude_decoder_from_computation_graph:
-            step_emit = emit_argmax_one_hot
+            step_emit, emit_key = emit_argmax_one_hot, "argmax"
         elif self.use_gumble:
-            step_emit = emit_gumbel_one_hot
+            step_emit, emit_key = emit_gumbel_one_hot, "gumbel"
         else:
-            step_emit = emit_straight_through_one_hot
+            step_emit, emit_key = emit_straight_through_one_hot, "straight_through"
 
-        # --- Autoregressive generation loop (KV-cached) ---
-        # init_decode processes the z-prefix once and returns both the logits predicting
-        # the first action and the key/value cache; each decode_step then feeds back only
-        # the newly chosen token, so attention over earlier positions is not recomputed
-        # (O(T) instead of O(T^2)). Gradients still reach z and the decoder params because
-        # the latent prefix (and the trunk) participate at every step.
+        # Replay a captured graph when there is no autograd graph to build. Grad mode is
+        # the right switch: it is off for action selection, the target-Q computation and
+        # evaluation (all of which dominate the call count), and on for the actor update,
+        # which must stay eager so gradients still reach z and the decoder parameters.
+        if self.use_cuda_graph and z.is_cuda and not torch.is_grad_enabled():
+            sequence = self._generate_graphed(z, step_emit, emit_key)
+        else:
+            sequence = self._generate(z, step_emit)
+
+        if not get_actions_as_one_hot:
+            return None, sequence
+        return sequence, None
+
+    def _generate(self, z: torch.Tensor, step_emit) -> torch.Tensor:
+        """Autoregressive generation loop (KV-cached).
+
+        ``init_decode`` processes the z-prefix once and returns both the logits predicting
+        the first action and the key/value cache; each ``decode_step`` then feeds back only
+        the newly chosen token, so attention over earlier positions is not recomputed
+        (O(T) instead of O(T^2)). Gradients still reach z and the decoder params because
+        the latent prefix (and the trunk) participate at every step.
+
+        Returns ``(batch, n_action_seq_length, n_words)``.
+        """
         generated_rows = []  # per-step emitted rows, each (batch, n_words)
         step_logits, past = self.model.decoder.init_decode(z, use_cache=True)
         for t in range(self.n_action_seq_length):
@@ -110,11 +142,67 @@ class ActionGen:
                     next_token, past, position=t + 1, use_cache=True
                 )
 
-        sequence = torch.stack(generated_rows, dim=1)  # (batch, n_action_seq_length, n_words)
+        return torch.stack(generated_rows, dim=1)
 
-        if not get_actions_as_one_hot:
-            return None, sequence
-        return sequence, None
+    def _generate_graphed(self, z: torch.Tensor, step_emit, emit_key: str) -> torch.Tensor:
+        """Run ``_generate`` by replaying a captured CUDA graph.
+
+        Capture records the concrete kernel sequence, so the KV cache's growing
+        ``torch.cat`` shapes are fine -- they are constants at capture time. Two properties
+        make this safe for a *training* loop:
+
+        * The graph holds pointers to the decoder's parameter tensors, and the optimizers
+          update those in place (``Adam`` mutates ``param.data``), so replays automatically
+          see current weights. Nothing in this codebase rebinds a parameter to a new
+          tensor, which would invalidate a graph silently.
+        * RNG inside the graph (the gumbel path) is handled by PyTorch's graph-safe
+          generator state, so each replay draws fresh noise rather than repeating capture.
+
+        A capture failure is downgraded to a one-time warning and permanently falls back to
+        eager, so an unsupported configuration slows a long run down instead of killing it.
+        """
+        key = (int(z.shape[0]), emit_key)
+        entry = self._graph_cache.get(key)
+
+        if entry is None:
+            try:
+                entry = self._capture_graph(z, step_emit)
+            except Exception as exc:  # pragma: no cover - depends on driver/GPU support
+                print(f"[GPS] CUDA graph capture failed ({exc}); falling back to eager "
+                      f"decoding for the rest of this run.", flush=True)
+                self.use_cuda_graph = False
+                return self._generate(z, step_emit)
+            self._graph_cache[key] = entry
+            print(f"[GPS] captured decoder CUDA graph for batch={key[0]} emit={key[1]}",
+                  flush=True)
+
+        static_z, graph, static_out = entry
+        static_z.copy_(z)
+        graph.replay()
+        # The graph writes into a fixed output buffer that the next replay overwrites, but
+        # callers hold the returned sequence across subsequent decoder calls (the training
+        # loop re-reads action_list_batch after stepping the environment), so hand back a
+        # copy rather than the live buffer.
+        return static_out.clone()
+
+    def _capture_graph(self, z: torch.Tensor, step_emit):
+        """Warm up and capture one (batch size, emit mode) variant of the decode loop."""
+        static_z = z.detach().clone()
+
+        # Warm up on a side stream first: lazy initialisation (cuBLAS handles, allocator
+        # blocks) must not land inside the captured graph.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                self._generate(static_z, step_emit)
+        torch.cuda.current_stream().wait_stream(side)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = self._generate(static_z, step_emit)
+
+        return static_z, graph, static_out
 
     def run_forward_actions(self, current_env, act_list):
         state = None
@@ -257,7 +345,8 @@ def get_decoder_api(decoder_model_path: str, decoder_seq_len: int, device: torch
                     var_for_sample: int = 1, use_gumble_in_decoder: bool = True, penalize_cyclic_position_revisits: bool = False,
                     deterministic_inference: bool = False, load_pretrained_weights: bool = True,
                     decoder_n_layer: int = 2, decoder_n_head: int = 4, decoder_n_embd: int = 32,
-                    decoder_dropout: Optional[float] = None) -> ActionGen:
+                    decoder_dropout: Optional[float] = None,
+                    decoder_use_cuda_graph: bool = False) -> ActionGen:
     decoder = get_decoder(decoder_f_name=decoder_model_path, decoder_seq_len=decoder_seq_len, device=device,
                           maze_n_actions=maze_n_actions, var_for_sample=var_for_sample,
                           load_pretrained_weights=load_pretrained_weights,
@@ -266,7 +355,8 @@ def get_decoder_api(decoder_model_path: str, decoder_seq_len: int, device: torch
     return ActionGen(pretrained_decoder=decoder, n_act_seq_len=decoder_seq_len, device=device,
                      maze_n_actions=maze_n_actions, use_gumble=use_gumble_in_decoder,
                      penalize_cyclic_position_revisits=penalize_cyclic_position_revisits,
-                     deterministic_inference=deterministic_inference)
+                     deterministic_inference=deterministic_inference,
+                     use_cuda_graph=decoder_use_cuda_graph)
 
 
 def get_decoder(decoder_f_name: str, decoder_seq_len: int, device: torch.device, maze_n_actions: int,
