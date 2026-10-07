@@ -2124,7 +2124,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
 
                         if math.isnan(total_norm) or math.isinf(total_norm):
                             print(f"Warning: Actor Gradient norm is {total_norm}")
-                            return
+                            continue_training = False
 
                         # Log gradient statistics
                         for name, param in actor_network.named_parameters():
@@ -2139,7 +2139,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                                 # Check for NaN or inf
                                 if torch.isnan(grad).any() or torch.isinf(grad).any():
                                     print(f'Actor: NaN or inf detected in gradients of layer: {name}')
-                                    return
+                                    continue_training = False
 
                         total_norm = 0
                         parameters = [p for p in decoder.model.decoder.parameters() if
@@ -2158,7 +2158,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
 
                         if math.isnan(total_norm) or math.isinf(total_norm):
                             print(f"Warning: Decoder Gradient norm is {total_norm}.")
-                            return
+                            continue_training = False
 
                         for name, param in decoder.model.decoder.named_parameters():
                             if param.grad is not None:
@@ -2172,7 +2172,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                                 # Check for NaN or inf
                                 if torch.isnan(grad).any() or torch.isinf(grad).any():
                                     print(f'Decoder: NaN or inf detected in gradients of layer: {name}')
-                                    return
+                                    continue_training = False
 
                         total_norm = 0
                         parameters = [p for p in critic_network.parameters() if p.grad is not None and p.requires_grad]
@@ -2190,7 +2190,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
 
                         if math.isnan(total_norm) or math.isinf(total_norm):
                             print(f"Warning: Critic Gradient norm is {total_norm}.")
-                            return
+                            continue_training = False
 
                         for name, param in critic_network.named_parameters():
                             if param.grad is not None:
@@ -2204,10 +2204,24 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                                 # Check for NaN or inf
                                 if torch.isnan(grad).any() or torch.isinf(grad).any():
                                     print(f'Critic: NaN or inf detected in gradients of layer: {name}')
-                                    return
+                                    continue_training = False
+
+                    # A non-finite gradient makes this update meaningless, so skip the
+                    # optimizer steps and unwind the training loop. The bare `return` this
+                    # replaces did skip the steps, but it also abandoned the rest of
+                    # train() -- including the final test evaluation -- so a run that
+                    # destabilised partway through exited 0, reported "Finished", and
+                    # produced no test numbers at all despite its best-on-validation
+                    # checkpoints already being on disk. Unwinding instead reaches the end
+                    # of train(), where that evaluation runs against those checkpoints.
+                    if not continue_training:
+                        print(f"[GPS] aborting training at global_step={global_step} after a "
+                              f"non-finite gradient. Running the final test evaluation on the "
+                              f"best-on-validation checkpoints saved so far.", flush=True)
+                        break
 
                     actor_optimizer.step()
-                    
+
                     # Update decoder if training end-to-end
                     if cfg.train_decoder_end_to_end:
                         decoder_optimizer.step()
@@ -2499,8 +2513,11 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                     )
 
 
-            if not continue_training:
-                break
+        # Dedented out of the `len(sequence_obs) > 1` block above so that an abort always
+        # unwinds: a sequence that took no environment steps would otherwise skip this
+        # check and keep the outer loop running.
+        if not continue_training:
+            break
 
     if not cfg.save_model or (cfg.val_eval_freq < 0 and cfg.save_model):
         torch.save(target_actor_network.state_dict(), actor_model_path)
