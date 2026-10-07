@@ -26,12 +26,13 @@
 #SBATCH --time=0-01:00:00
 #SBATCH --job-name=e6_profile
 #SBATCH --output=sbatch/logs/e6_profile_trainloop-%J.out
-#SBATCH --gpus=1
+# Pin the GPU type so the matrix stays on one class of hardware (see e0 for why). The
+# profiler only needs relative function rankings, so it tolerates node-to-node variation
+# better than the timing runs do -- but absolute times still shift with node CPU, since
+# what this is measuring is CPU-side dispatch.
+#SBATCH --gpus=gtx_1080:1
 #SBATCH --mem=24G
 #SBATCH --cpus-per-task=4
-# Pin to the node E0 was measured on, so nothing drifts onto different silicon
-# mid-matrix. Drop this if it queues too long and note the node in the results.
-#SBATCH --nodelist=ise-pheno-02
 
 module load anaconda
 source activate gps_env

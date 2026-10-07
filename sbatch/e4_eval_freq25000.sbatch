@@ -10,7 +10,9 @@
 #SBATCH --time=0-08:00:00
 #SBATCH --job-name=e4_eval_25000
 #SBATCH --output=sbatch/logs/e4_eval_freq25000-%J.out
-#SBATCH --gpus=1
+# Pin the GPU type: the partition is heterogeneous (gtx_1080, rtx_2080, rtx_3090) and
+# the 10.4h baseline ran on gtx_1080, so comparisons must stay on that class.
+#SBATCH --gpus=gtx_1080:1
 #SBATCH --mem=24G
 #SBATCH --cpus-per-task=4
 

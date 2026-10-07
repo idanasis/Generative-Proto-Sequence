@@ -11,13 +11,13 @@
 #SBATCH --time=0-00:20:00
 #SBATCH --job-name=e0_bench_decoder
 #SBATCH --output=sbatch/logs/e0_bench_decoder-%J.out
-#SBATCH --gpus=1
+# Pin the GPU *type*, not a specific node: the partition is heterogeneous (gtx_1080,
+# rtx_2080, rtx_3090) and the 10.4h / 50.3h baseline runs were both on gtx_1080, so every
+# measurement meant to compare against them has to land on the same class of hardware.
+# Pinning the type rather than the node keeps that guarantee without the queueing stall.
+#SBATCH --gpus=gtx_1080:1
 #SBATCH --mem=8G
 #SBATCH --cpus-per-task=4
-# Pinned to the node the first E0 ran on, so the new rows are directly comparable with
-# the 11.538 ms eager measurement rather than against different silicon. Drop this if it
-# queues too long, but then re-measure the eager rows alongside the new ones.
-#SBATCH --nodelist=ise-pheno-02
 
 module load anaconda
 source activate gps_env
