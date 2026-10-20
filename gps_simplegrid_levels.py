@@ -1288,8 +1288,17 @@ def eval_candidates_with_critic(action_list_batch: torch.Tensor, action_list_pro
 
 def select_action(action_list_batch: torch.Tensor, action_list_proba_batch: torch.Tensor, batch_q_stack, cfg: Config, rng_sample_from_candidates: random.Random) -> \
 tuple[torch.Tensor, torch.Tensor]:
+    # A non-finite Q value makes both branches below fail -- torch.multinomial raises
+    # "probability tensor contains either `inf`, `nan` or element < 0" outright, which
+    # killed three 3-hour runs before they could write their final evaluation. Fall back to
+    # the first candidate instead: the run is already past saving at that point, but it
+    # reaches the end of train() and evaluates its best saved checkpoint.
+    if not torch.isfinite(batch_q_stack).all():
+        print(f"WARNING: non-finite Q values in select_action; falling back to candidate 0.",
+              flush=True)
+        q_idx = torch.tensor([0], device=batch_q_stack.device)
     # Check if batch_q_stack has shape (1, 1)
-    if batch_q_stack.shape == (1, 1):
+    elif batch_q_stack.shape == (1, 1):
         # Directly use index 0 if both dimensions are 1
         q_idx = torch.tensor([0], device=batch_q_stack.device)
     else:

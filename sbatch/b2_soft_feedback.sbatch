@@ -28,7 +28,18 @@
 # NaN abort now preserves the final test evaluation (§8.1), so an instability still yields
 # a number.
 #
-# Single variable vs A1: same 5 heads, no diversity or length penalty.
+# Single variable vs the 0.53-val baseline: one proto-plan candidate, no diversity or
+# length penalty, soft token feedback the only difference.
+#
+# Deliberately NOT 5 heads. The multi-head runs (A1/A2/A3) peaked at step 60000 and then
+# degraded for 250k steps before dying on NaN Q-values, because the Bellman target takes
+# argmax over the candidates -- maximisation bias, which is a no-op at 1 candidate. Testing
+# soft feedback on top of that would confound the two.
+#
+# --min_qf_value is set because the Q-clipping in the training loop is gated on it and has
+# therefore never been active in any run: max_qf_value=1.0 was dead config. Episodic
+# returns span roughly -20 to +1. Both 1-candidate full runs still hit NaN gradients (steps
+# 625476 and 918000), so bounding Q is worthwhile even without extra candidates.
 #
 #SBATCH --partition=main
 #SBATCH --time=0-12:00:00
@@ -57,7 +68,9 @@ poetry run python gps_simplegrid_levels.py \
     --eval_test_dataset_during_training_freq -1 \
     --total_timesteps 500000 \
     --total_steps_e 15000 \
-    --n_proto_plan_candidates 5 \
+    --n_proto_plan_candidates 1 \
+    --min_qf_value -20.0 \
+    --max_qf_value 1.0 \
     --decoder_soft_token_feedback \
     --slurm_job_id "${SLURM_JOB_ID}"
 

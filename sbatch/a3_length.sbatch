@@ -1,34 +1,38 @@
 #!/bin/bash
-# A3 -- Penalise proto-plans that fall outside each head's intended length band.
+# A3 -- Penalise proto-plans that are too short.  (single-candidate version)
 #
-# The most directly targeted of the three experiments. check_z_influence.py showed the
-# actor has collapsed onto embeddings that decode to length-1 plans:
+# check_z_influence.py showed the actor has collapsed onto embeddings that decode to
+# length-1 plans:
 #
 #   actor z: mean pairwise cosine similarity = 0.7783  (1.0 = all identical)
 #   sequences from actor z: unique(trimmed) = 5/256, mean_len = 1.01
 #
-# while the same (trained) decoder fed *random* z produces 44 unique sequences at
-# mean_len 1.77 -- so the decoder is healthy and the actor is the collapsed half. A
-# length-1 plan is a safe local optimum: it cannot commit to a wrong multi-step move, so
-# the critic prefers it, and the whole proto-plan idea degenerates into a 1-step policy.
+# while the same trained decoder fed *random* z produces 44 unique sequences at mean_len
+# 1.77 -- the decoder is healthy, the actor almost never asks for a long plan. A length-1
+# plan is a safe local optimum: it cannot commit to a wrong multi-step move, so the critic
+# prefers it and the proto-plan idea degenerates into a 1-step policy.
 #
-# sequence_length_weight pushes each head toward its own band -- min_lengths_per_head
-# [1,2,4,6,8], max [2,4,6,8,10] -- which attacks mean_len=1.01 head-on and forces the
-# heads apart at the same time.
+# This pushes plans into a 4-10 action band, attacking mean_len=1.01 head-on.
 #
-# Requires n_proto_plan_candidates 5: the penalty asserts len(min_lengths_per_head) ==
-# n_heads, and the five-element defaults imply 5 was the intended configuration.
+# SINGLE CANDIDATE. The earlier 5-head version of this experiment peaked at step 60000 and
+# then degraded for 250k steps before dying on NaN Q-values: the Bellman target takes
+# argmax over candidates, which is maximisation bias with 5 and a no-op with 1. The length
+# bands are therefore single-element here rather than the 5-element Config defaults --
+# sequence_length_weight asserts len(min_lengths_per_head) == n_proto_plan_candidates.
 #
-# NOTE this experiment only works because of the floor fix in
-# compute_sequence_lengths_differentiable -- torch.floor has zero gradient, so before that
-# fix this penalty was logged but contributed nothing to learning.
+# --min_qf_value is set because the Q-clipping is gated on it and has never been active in
+# any run (max_qf_value=1.0 was dead config). Episodic returns span roughly -20 to +1. Both
+# 1-candidate full runs still hit NaN gradients (steps 625476 and 918000), so bounding Q
+# matters even without extra candidates.
 #
-# WEIGHT SCALING: the penalty is a *sum* over batch x heads = 256 x 5 = 1280 terms, each
-# up to ~8 when plans are length 1. So the raw penalty is in the thousands while
-# actor_loss is ~0.4 -- hence 1e-4, which lands the contribution in the same order as the
-# Q term. Watch losses/sequence_length_loss in wandb: multiply it by this weight and
-# compare against losses/actor_loss. If it dwarfs the Q term the agent will optimise
-# length instead of success; if it is negligible, raise it.
+# Only works at all because of the torch.floor removal in
+# compute_sequence_lengths_differentiable -- floor has zero gradient, so before that fix
+# this penalty was logged but could not influence training.
+#
+# WEIGHT SCALING: the penalty is a *sum* over batch x heads = 256 x 1 = 256 terms, each up
+# to ~3 when plans are length 1 (min band 4). Raw penalty is in the hundreds while
+# actor_loss is ~0.4, hence 5e-4. Watch losses/sequence_length_loss x weight against
+# losses/actor_loss: if it dwarfs the Q term the agent optimises length instead of success.
 #
 #SBATCH --partition=main
 #SBATCH --time=0-12:00:00
@@ -57,8 +61,12 @@ poetry run python gps_simplegrid_levels.py \
     --eval_test_dataset_during_training_freq -1 \
     --total_timesteps 500000 \
     --total_steps_e 15000 \
-    --n_proto_plan_candidates 5 \
-    --sequence_length_weight 0.0001 \
+    --n_proto_plan_candidates 1 \
+    --min_qf_value -20.0 \
+    --max_qf_value 1.0 \
+    --sequence_length_weight 0.0005 \
+    --min_lengths_per_head 4 \
+    --max_lengths_per_head 10 \
     --slurm_job_id "${SLURM_JOB_ID}"
 
 END=$(date +%s)
