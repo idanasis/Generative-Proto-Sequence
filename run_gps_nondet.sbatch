@@ -29,8 +29,8 @@
 module load anaconda
 source activate gps_env
 
-# Bypass the interactive login by setting the key directly
-export WANDB_API_KEY="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"
+# wandb credentials come from ~/.netrc (`wandb login`, run once on the login node).
+# Do NOT hardcode WANDB_API_KEY here -- see the note in run_gps.sbatch.
 # No CUBLAS_WORKSPACE_CONFIG here -- it is only needed for deterministic cuBLAS.
 
 START=$(date +%s)
