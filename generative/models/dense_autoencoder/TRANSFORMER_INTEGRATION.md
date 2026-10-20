@@ -8,7 +8,15 @@ Files touched:
 - **New:** [mingpt_decoder.py](mingpt_decoder.py)
 - **Changed:** [dense_var_auto_encoder_vin_1.py](dense_var_auto_encoder_vin_1.py)
 - **Changed:** [decoder_utils.py](decoder_utils.py)
-- **Changed:** [gps_simplegrid_levels.py](../../../gps_simplegrid_levels.py) (§7)
+- **Changed:** [gps_simplegrid_levels.py](../../../gps_simplegrid_levels.py) (§7, §8)
+
+Tooling added for the §7–§8 investigations, all at the repository root:
+- `bench_decoder.py` — per-call decoder microbenchmark (§7.2)
+- `eval_checkpoint.py` — run the test evaluation against saved checkpoints, for runs that
+  died before reaching their own (§8.1)
+- `check_z_influence.py` — separate actor collapse from decoder collapse (§8.3)
+- `sbatch/` — the experiment matrix (`e0`–`e8` runtime, `a1`–`a3`/`b2` accuracy), plus
+  `sbatch/_common.sh` and `sbatch/eval_checkpoint.sbatch`
 
 ---
 
@@ -560,9 +568,17 @@ Baseline to beat: **0.488**. Noise floor: **~0.05**.
 | `sbatch/a2_diversity.sbatch` | A1 + `--diversity_weight 0.1` | the 0.7783 cosine similarity. `compute_diversity_loss_with_normalized_embeddings` acts on the **actor's head embeddings**, so it needs >1 head to have pairs at all. |
 | `sbatch/a3_length.sbatch` | A1 + `--sequence_length_weight 1e-4` | `mean_len = 1.01`, head-on. Per-head bands `[1,2,4,6,8]` force plans longer and heads apart. Only works because of §8.4. |
 
-Weight scaling for A3: the penalty is a **sum** over batch x heads = 1280 terms, each up to
-~8, so the raw value is in the thousands while `actor_loss` is ~0.4. Watch
-`losses/sequence_length_loss` x weight against `losses/actor_loss`.
+**Result — all three were worse, and all destabilised. See §8.8.**
+
+| run | best val | best step | outcome |
+|---|---|---|---|
+| baseline (1 candidate) | **0.53** | **305,000** | — |
+| A1 (5 candidates) | 0.37 | 60,000 | NaN crash at 3:25 |
+| A2 (5 + diversity) | 0.44 | 60,000 | NaN crash at 2:35 |
+| A3 (5 + length) | 0.43 | 60,000 | NaN crash at 3:19 |
+
+Each peaked at step 60,000 and then degraded for ~250k steps before dying. These measured
+instability, not the mechanism — **multi-head remains untested, not refuted.**
 
 ### 8.6 Open: forward response vs backward gradient
 
@@ -625,10 +641,77 @@ backward pass differs.** Applied only to the hard-one-hot emission modes (`gumbe
 one-hot, so feeding it back would change what the model generates rather than only how
 gradients flow.
 
-Default off, so it is A/B-able against A1. `sbatch/b2_soft_feedback.sbatch` runs it with the
-same 5 heads as A1 and no other regulariser, making it a single-variable comparison.
+Default off, so it is A/B-able. `sbatch/b2_soft_feedback.sbatch` runs it at **one** proto-plan
+candidate with no other regulariser, making it a single-variable comparison against the
+0.53-val / 0.432-test baseline. (It was originally written with 5 candidates; see §8.8 for
+why that was wrong.)
 
 **Risk:** a 10-step differentiable chain is less stable than a 1-step one, and both full runs
 already hit NaN gradients. Watch `gradient/decoder_norm` and `gradient/actor_norm`. Per §8.1
 a NaN abort now still produces a final test evaluation, so an instability yields a number
 rather than nothing.
+
+---
+
+## 9. Maximisation bias, and a brake that was never connected (round 4)
+
+### 9.1 Why A1–A3 all destabilised
+
+All three died the same way, 2.5–3.5h in:
+
+```
+RuntimeError: probability tensor contains either `inf`, `nan` or element < 0
+  in select_action
+```
+
+The critic had produced **NaN Q-values**, and `torch.multinomial` refuses them. The crash
+site is itself diagnostic: with `n_proto_plan_candidates=1`, `batch_q_stack.shape == (1, 1)`
+takes the `q_idx = tensor([0])` branch and `multinomial` is **never reached**. That branch
+had been dead in every previous run; 5 candidates made it live.
+
+**The cause is the Bellman target:**
+
+```python
+qf_next_target = qf_next_target.view(cfg.batch_size, cfg.n_proto_plan_candidates)
+best_candidate_indices = torch.argmax(qf_next_target, dim=1)      # max over candidates
+qf_next_target = qf_next_target[range(cfg.batch_size), best_candidate_indices]
+```
+
+With 1 candidate that `argmax` is a no-op. With 5 it takes the maximum of five noisy
+estimates — textbook **maximisation bias**. The inflated value becomes the training target,
+the critic learns to predict higher, and it compounds until Q diverges to NaN. Hence the
+peak at step 60,000 followed by 250k steps of decay.
+
+### 9.2 `max_qf_value` has never been applied
+
+The standard defence already exists in the code and has never run:
+
+```python
+if cfg.min_qf_value is not None:
+    qf1_a_values = torch.clip(qf1_a_values, min=cfg.min_qf_value, max=cfg.max_qf_value)
+```
+
+`min_qf_value` defaults to `None`, so the clip is skipped and **`max_qf_value = 1.0` is dead
+config** — in every run in this document, including the MLP baseline. Episodic returns span
+roughly −20 to +1, so `--min_qf_value -20.0 --max_qf_value 1.0` activates it.
+
+Worth enabling even at one candidate: both 1-candidate full runs also reached NaN gradients
+(steps 625,476 and 918,000). Five candidates accelerate the divergence; they do not create it.
+
+### 9.3 `select_action` now survives non-finite Q
+
+A NaN there killed three 3-hour runs outright, and because they crashed they never ran their
+final evaluation — the numbers in §8.5 had to be recovered from log greps. `select_action`
+now falls back to candidate 0 with a warning. This fixes nothing; it means an instability
+still yields a result, like the §8.1 abort.
+
+### 9.4 Revised experiments — back to one candidate
+
+A1 and A2 are shelved: A1 *is* the multi-candidate change, and the diversity loss compares
+pairs of actor heads, so at one head the term is identically zero. Both need the §9.2 clip
+before they are worth retrying.
+
+| | config | note |
+|---|---|---|
+| `sbatch/a3_length.sbatch` | 1 candidate, `--sequence_length_weight 5e-4`, band `4`–`10`, `--min_qf_value -20.0` | Single-element length bands because the penalty asserts `len(min_lengths_per_head) == n_proto_plan_candidates`. Weight raised from 1e-4 since the sum is now over 256 terms, not 1280. |
+| `sbatch/b2_soft_feedback.sbatch` | 1 candidate, `--decoder_soft_token_feedback`, `--min_qf_value -20.0` | Single variable against the 0.53-val baseline. |
