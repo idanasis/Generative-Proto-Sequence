@@ -289,6 +289,13 @@ class Config:
        tiny kernels per call and is almost entirely dispatch overhead, so this is worth
        ~8x at batch 1 and ~2x at batch 256. The actor update stays eager so gradients
        still flow. Requires CUDA; falls back to eager with a warning if capture fails"""
+    decoder_soft_token_feedback: bool = False
+    """feed the emitted one-hot row back into the next decode step instead of a detached
+       argmax index. Generation is unchanged (for a one-hot row, row @ tok_emb.weight ==
+       tok_emb(argmax)); only the backward pass differs, letting the critic's gradient
+       reach z through all 10 positions rather than only the prefix token. Aimed at the
+       actor failing to learn state-dependent embeddings -- see §8.6 of
+       TRANSFORMER_INTEGRATION.md. Only applies to the one-hot emission modes"""
     use_gumble_in_decoder: bool = True
     """
     If True, the decoder's `gen_action_seq` function uses the Gumbel-Softmax method, which preserves gradients for backpropagation.
@@ -1660,7 +1667,8 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                               deterministic_inference=cfg.deterministic_inference, load_pretrained_weights=load_pretrained_decoder,
                               decoder_n_layer=cfg.decoder_n_layer, decoder_n_head=cfg.decoder_n_head,
                               decoder_n_embd=cfg.decoder_n_embd, decoder_dropout=cfg.decoder_dropout,
-                              decoder_use_cuda_graph=cfg.decoder_use_cuda_graph)
+                              decoder_use_cuda_graph=cfg.decoder_use_cuda_graph,
+                              decoder_soft_token_feedback=cfg.decoder_soft_token_feedback)
     
     # Set decoder to training mode if training end-to-end
     if cfg.train_decoder_end_to_end:

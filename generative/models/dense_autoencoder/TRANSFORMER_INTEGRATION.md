@@ -465,3 +465,170 @@ measured with both bugs active and must be re-run before it means anything.
 For calibration when reading the new runs: at 30k steps (3% of a run) E3/E8 reached 0.25–0.27
 val success with 1.24–1.41 valid actions per sequence. Per §6.5's own recalibration, ~1.6 is
 normal for this task even for the 0.794 MLP, so short sequences are **not** a collapse signal.
+
+**Resolved in §8:** the fixed code measures 0.432–0.488 test success — parity with the 0.509
+GPT run, not an improvement. §8 has the diagnosis.
+
+---
+
+## 8. Accuracy investigation (round 3)
+
+### 8.1 Three more correctness bugs
+
+All pre-existing, all found by runs dying rather than by review.
+
+| bug | symptom | fix |
+|---|---|---|
+| A non-finite gradient `return`ed out of `train()` | Run exits 0, reports "Finished", **no test evaluation at all** despite good checkpoints on disk (job 22379903, step 625476) | Set `continue_training = False` and unwind to the end of `train()`, which still runs the test evaluation. Optimizer steps are still skipped, so NaN gradients never reach the weights. |
+| The actor-diversity logging block assigned to `action_list_batch` | `AttributeError: 'NoneType' object has no attribute 'argmax'` (job 22379902, step 650000 = 13 x 50000) | It calls `gen_action_seq` without `get_actions_as_one_hot`, which returns `(None, probs)`, clobbering the acting loop's variable. If an episode ended on that same step the verbose logger crashed. Now uses local names. Intermittent: needs a multiple of `evaluate_actor_diversity_every_k_epochs` *and* an episode ending on it. |
+| `eval_with_pretrained_model` never reloaded the decoder | Test success 0.056 with `valid actions per sequence = 10.0` (a decoder that never emits EOS) | It loads actor and critic from the best-on-validation checkpoint but used the *live* decoder object. Invisible with a frozen pretrained decoder; under `--train_decoder_end_to_end` it paired a best-on-validation actor with a decoder from ~600k steps later. Now loads the matching `decoder` checkpoint and restores the caller's in a `finally` (the function also runs mid-training). |
+
+`eval_checkpoint.py` + `sbatch/eval_checkpoint.sbatch` were added to recover test numbers from
+runs that died before their final evaluation — minutes against checkpoints already on disk,
+versus re-running for hours.
+
+### 8.2 Measured accuracy after §7.1
+
+| run | test success (stochastic) | deterministic inference |
+|---|---|---|
+| `earthy-bird-16` (deterministic) | 0.432 | 0.329 |
+| `true-capybara-17` (non-deterministic) | 0.488 | 0.381 |
+| **prior GPT run (`eager-lion-9`)** | **0.509** | — |
+| **MLP baseline** | **~0.794** | — |
+
+**The §7.1 fixes did not improve accuracy.** At n=1000, SE ≈ 0.016, so 0.488 is
+indistinguishable from 0.509 while 0.432 is genuinely below it.
+
+Two calibration points for every future experiment:
+
+- **Run-to-run variance is ~0.05** (0.432 vs 0.488 on the same config bar determinism), so
+  anything under that is noise.
+- **Deterministic inference costs ~0.1** in both runs. `deterministic_inference` defaults to
+  `True`, so the deterministic pass is the pessimistic number; both are printed.
+
+The 0.794 MLP run's summary shows `gradient/decoder_norm: 1255`, which means **§7.1.1's
+accumulating-gradient bug was active in the MLP baseline too**. The bug applied to whichever
+decoder was plugged in, so it cannot explain the architecture gap.
+
+### 8.3 Diagnosis: the actor collapsed, not the decoder
+
+`sequences/num_unique` collapses monotonically in the GPT runs while the MLP baseline
+sustains ~40.8. That metric is end-to-end (observation → actor → `z` → decoded sequence), so
+it cannot say which half failed — and the two halves have opposite fixes. `check_z_influence.py`
+separates them, offline, from saved checkpoints.
+
+Measured on `earthy-bird-16`, 256 samples:
+
+```
+PART A -- decoder, fed random z
+  untrained decoder (control)    unique(trimmed)=20/256   mean_len=3.06
+  trained decoder                unique(trimmed)=44/256   mean_len=1.77
+
+PART B -- actor, fed real observations
+  mean pairwise cosine similarity = 0.7783   (1.0 = all identical)
+  std across embedding dims       = 0.0133
+  sequences from actor z          unique(trimmed)=5/256   mean_len=1.01
+```
+
+**The decoder is healthy** — more z-responsive after training than at initialisation (44 vs
+20 unique). **The actor collapsed**: near-constant embeddings landing in a region of `z`-space
+that decodes to single-action plans. Five distinct outputs across 256 states.
+
+**The method has degenerated into a 1-step policy.** Generate a multi-action plan and let the
+critic choose among candidates has become "emit one action at a time" through an elaborate
+actor → `z` → decoder pipeline. It also explains the ~20 decoder generations per episode seen
+throughout §7. A length-1 plan is a sensible local optimum: it cannot commit to a wrong
+multi-step move, so the critic prefers it.
+
+### 8.4 `sequence_length_weight` was a no-op
+
+`compute_sequence_lengths_differentiable` ended with `lengths = torch.floor(lengths)`.
+`floor` has zero gradient everywhere, so the function — whose name states its purpose —
+returned a constant with respect to the parameters. Both consumers (`sequence_length_weight`
+and `invalid_actions_weight`) add their penalty to `actor_loss`, so those terms were **logged
+but contributed no gradient** and could not influence training. The floor is removed.
+
+### 8.5 Experiments
+
+All at `--total_timesteps 500000` (validation peaks ~305k and declines, so the second half
+only costs time) and `--no-torch_deterministic` (1.71x faster; these are exploratory).
+Baseline to beat: **0.488**. Noise floor: **~0.05**.
+
+| | config | targets |
+|---|---|---|
+| `sbatch/a1_multihead.sbatch` | `--n_proto_plan_candidates 5` | `n_proto_plan_candidates` defaults to 1, which makes candidate selection, `sample_from_candidates` and the per-head softmax weighting all no-ops. The five-element `min_lengths_per_head` defaults imply 5 was intended. Control for A2/A3. |
+| `sbatch/a2_diversity.sbatch` | A1 + `--diversity_weight 0.1` | the 0.7783 cosine similarity. `compute_diversity_loss_with_normalized_embeddings` acts on the **actor's head embeddings**, so it needs >1 head to have pairs at all. |
+| `sbatch/a3_length.sbatch` | A1 + `--sequence_length_weight 1e-4` | `mean_len = 1.01`, head-on. Per-head bands `[1,2,4,6,8]` force plans longer and heads apart. Only works because of §8.4. |
+
+Weight scaling for A3: the penalty is a **sum** over batch x heads = 1280 terms, each up to
+~8, so the raw value is in the thousands while `actor_loss` is ~0.4. Watch
+`losses/sequence_length_loss` x weight against `losses/actor_loss`.
+
+### 8.6 Open: forward response vs backward gradient
+
+Part A tested whether the decoder responds to `z` in the **forward** direction. It says
+nothing about **gradient quality in the backward** direction, and those are different
+properties. So the actor's collapse may still be *caused* by the decoder:
+
+- **(a) The actor was never the problem.** The MLP maps `z` → all 50 logits in one linear
+  layer, so near-identical `z` still perturbs all 10 positions and yields different
+  sequences. The GPT's autoregressive chain washes small `z` differences out against
+  accumulating token history. Fix would be decoder-side.
+- **(b) The MLP passed a stronger gradient to the actor.** Its path is critic → one Gumbel →
+  one linear → `z`. The GPT's is critic → Gumbel at 10 steps → through the trunk each time →
+  `z_proj` → `z`, with fed-back tokens **detached**. A weaker signal makes "emit a constant
+  safe `z`" attractive. Consistent with actor gradient norms: MLP 0.387 vs GPT 0.197–0.265.
+
+Under (b) the fix is **soft token feedback** — `row @ tok_emb.weight` instead of
+`tok_emb(argmax(row).detach())`. With `hard=True` Gumbel the forward pass is numerically
+identical (`row` is one-hot), but gradients then flow through the whole chain to `z`.
+
+**Resolved — and no new code was needed.** The training loop already logs this metric
+(`mean cosine similarity all pairs`, over the target actor's embeddings on a batch of
+next-states), so the answer was in the old logs all along:
+
+| | MLP (job 18136376, 0.794) | GPT (job 22379902, 0.432) |
+|---|---|---|
+| actor cosine, **early → late** | **1.0 → 0.507** | **0.706 → 0.619** |
+| plan length (over *unique* sequences) | 3.67 | 3.17 |
+| end-to-end unique sequences | **41.0** | **17.5** |
+
+**The trajectory is the finding, not the endpoint.** The MLP's actor started *fully
+collapsed* — cosine 1.0, one embedding for every state — and learned down to 0.507. Ours
+started better (0.706) and barely moved (0.619). The MLP's actor learned; ours did not.
+
+That points at the learning signal rather than the starting point, i.e. explanation **(b)**,
+and matches the actor gradient norms (MLP 0.387 vs GPT 0.197–0.265).
+
+**Correction to §8.3's phrasing.** "Degenerated into a 1-step policy" is right in practice
+but was stated too strongly. `mean_len = 1.01` (from `check_z_influence.py`) averages over
+**all 256 states**; the log's `mean length action sequences: 3.17` averages over the
+**unique** sequences only. Both are true: nearly every state receives a 1-action plan, while
+the ~17 distinct plans that exist average 3.17 actions. The decoder *can* produce long plans
+— the actor almost never asks for one.
+
+### 8.7 B2 — soft token feedback  (`--decoder_soft_token_feedback`)
+
+The fix implied by (b). `ActionGen._generate` fed the next step a **detached argmax index**,
+so gradient reached `z` only through the prefix token; the 10-step chain was a gradient dead
+end. With the flag, the emitted row is fed back directly and `GPT.decode_step` multiplies the
+embedding table instead of indexing it:
+
+```python
+token_embeddings = (tokens @ self.tok_emb.weight).unsqueeze(1)   # float row
+token_embeddings = self.tok_emb(tokens.view(-1, 1))              # integer index
+```
+
+For a one-hot row these are mathematically identical, so **generation is unchanged — only the
+backward pass differs.** Applied only to the hard-one-hot emission modes (`gumbel`,
+`straight_through`, `argmax`): the scaled-probs row is a temperature-0.01 softmax, not a
+one-hot, so feeding it back would change what the model generates rather than only how
+gradients flow.
+
+Default off, so it is A/B-able against A1. `sbatch/b2_soft_feedback.sbatch` runs it with the
+same 5 heads as A1 and no other regulariser, making it a single-variable comparison.
+
+**Risk:** a 10-step differentiable chain is less stable than a 1-step one, and both full runs
+already hit NaN gradients. Watch `gradient/decoder_norm` and `gradient/actor_norm`. Per §8.1
+a NaN abort now still produces a final test evaluation, so an instability yields a number
+rather than nothing.
