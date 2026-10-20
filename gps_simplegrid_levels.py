@@ -749,8 +749,37 @@ def eval_with_pretrained_model(
     else:
         critic = None
 
-    episodic_returns, episodic_successes, episodic_num_decoder_generations, episodic_avg_valid_actions_in_sequences, \
-    episodic_avg_unused_actions_in_sequences, episodic_avg_agent_step_ratio_in_sequences, all_env_eval_stats, successful_episode_inference_times, successful_episode_wall_clock_times_per_optimal_step = eval_model(cfg, dataset, run_name, actor, decoder, device, capture_video, critic=critic, verbose_stats=True, deterministic_eval=deterministic_evaluation)
+    # The actor and critic above are loaded from the best-on-validation checkpoint, but
+    # ``decoder`` arrives as the *live* object. With a frozen pretrained decoder those are
+    # the same weights, so this never mattered -- under --train_decoder_end_to_end they are
+    # not: the decoder kept training after that checkpoint was written, so the evaluation
+    # would pair a best-on-validation actor with whatever state the decoder happened to end
+    # in. Load the decoder that was saved alongside them.
+    saved_decoder_state = None
+    if cfg.train_decoder_end_to_end and critic_model_path is not None:
+        decoder_model_path = critic_model_path.replace('/critic', '/decoder')
+        if os.path.isfile(decoder_model_path):
+            saved_decoder_state = copy.deepcopy(decoder.model.state_dict())
+            decoder.model.load_state_dict(torch.load(decoder_model_path, map_location=device))
+            print(f"loaded matching decoder checkpoint from {decoder_model_path}")
+        else:
+            print(f"WARNING: {decoder_model_path} not found; evaluating with the live "
+                  f"decoder, which does not match the actor/critic checkpoint.")
+
+    decoder_was_training = decoder.model.training
+    decoder.model.eval()
+
+    try:
+        episodic_returns, episodic_successes, episodic_num_decoder_generations, episodic_avg_valid_actions_in_sequences, \
+            episodic_avg_unused_actions_in_sequences, episodic_avg_agent_step_ratio_in_sequences, all_env_eval_stats, successful_episode_inference_times, successful_episode_wall_clock_times_per_optimal_step = eval_model(cfg, dataset, run_name, actor, decoder, device, capture_video, critic=critic, verbose_stats=True, deterministic_eval=deterministic_evaluation)
+    finally:
+        # Put the caller's decoder back exactly as it was: this function is also called
+        # mid-training (eval_test_dataset_during_training_freq), where swapping in a
+        # checkpoint and leaving it there would corrupt the run that follows.
+        if saved_decoder_state is not None:
+            decoder.model.load_state_dict(saved_decoder_state)
+        if decoder_was_training:
+            decoder.model.train()
 
     # Calculate inference timing statistics for successful episodes only
     total_episodes = len(episodic_returns)
@@ -2395,9 +2424,19 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                 if cfg.evaluate_actor_diversity_every_k_epochs > 0 and global_step % run_evaluation_k == 0:
                     with torch.no_grad():
                         current_fixed_embedding = actor_network(fixed_obs_tensor)
-                        action_list_batch, action_list_proba_batch = decoder.gen_action_seq(
+                        # Use local names here. This diagnostic decode used to assign to
+                        # action_list_batch / action_list_proba_batch, which are the
+                        # acting loop's variables -- and because it calls gen_action_seq
+                        # without get_actions_as_one_hot, it returns (None, probs), so it
+                        # left action_list_batch as None. If the episode happened to end
+                        # on the same step, the verbose episode logger below then did
+                        # None.argmax(-1) and killed the run. Intermittent by nature: it
+                        # needs a step that is a multiple of evaluate_actor_diversity_every_k_epochs
+                        # AND an episode ending on it (observed at global_step=650000,
+                        # i.e. 13 x 50000, on job 22379902).
+                        _, diversity_action_probas = decoder.gen_action_seq(
                             gen_input=current_fixed_embedding)
-                        action_seq_per_state = action_list_proba_batch.argmax(-1).view(fixed_obs_tensor.shape[0],
+                        action_seq_per_state = diversity_action_probas.argmax(-1).view(fixed_obs_tensor.shape[0],
                                                                                        cfg.n_proto_plan_candidates,
                                                                                        cfg.n_actions_in_seq)
                         trimmed_sequences = [[DenseVAE.trim_action_sequence_from_eos_tokens(seq)[0] for seq in batch]
