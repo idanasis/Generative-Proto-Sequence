@@ -1358,9 +1358,13 @@ def compute_sequence_lengths_differentiable(sequences, eos_token=4, epsilon=1e-6
     # Stack the list into a tensor
     cum_prod = torch.cat(cum_prod_list, dim=-1)  # Shape: (..., seq_len)
 
-    # Compute sequence lengths
+    # Compute sequence lengths. Deliberately NOT floored: torch.floor has zero gradient
+    # everywhere, so rounding here made this function -- whose whole purpose is to be
+    # differentiable -- return a constant with respect to the parameters. Both consumers
+    # (invalid_actions_weight and sequence_length_weight) add their penalty to actor_loss,
+    # so with the floor in place those terms were logged but contributed no gradient and
+    # could not influence training at all. The soft length is what the penalties want.
     lengths = torch.sum(cum_prod, dim=-1)
-    lengths = torch.floor(lengths)
 
     return lengths
 
