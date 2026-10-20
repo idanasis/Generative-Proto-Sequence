@@ -14,8 +14,12 @@
 module load anaconda
 source activate gps_env
 
-# Bypass the interactive login by setting the key directly
-export WANDB_API_KEY="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"
+# wandb credentials come from ~/.netrc, written once by running `wandb login` on the login
+# node. The home directory is shared with the compute nodes, so batch jobs pick it up.
+#
+# Do NOT hardcode WANDB_API_KEY here. This file is committed, and wandb scans repositories
+# for leaked keys and revokes them -- which is what killed jobs 23429516 and 23429517 with
+# "CommError: 'NoneType' object has no attribute 'get'" twenty seconds after startup.
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 START=$(date +%s)
