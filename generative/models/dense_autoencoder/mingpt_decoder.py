@@ -44,6 +44,9 @@ class GPTConfig:
         embd_pdrop: Dropout applied to the summed token + positional embeddings.
         resid_pdrop: Dropout applied to the residual paths inside each block.
         attn_pdrop: Dropout applied to the attention probabilities.
+        normalize_z: Rescale ``z`` to a fixed L2 norm before projecting it. Off by default.
+        z_scale_init: The norm ``normalize_z`` targets, as a learnable scalar's initial
+            value. Ignored when ``normalize_z`` is False.
     """
 
     vocab_size: int = 5
@@ -55,6 +58,8 @@ class GPTConfig:
     embd_pdrop: float = 0.1
     resid_pdrop: float = 0.1
     attn_pdrop: float = 0.1
+    normalize_z: bool = False
+    z_scale_init: float = 0.2
 
 
 class CausalSelfAttention(nn.Module):
@@ -205,6 +210,28 @@ class GPT(nn.Module):
         # The result is treated as the first ("prefix") token of the sequence.
         self.z_proj: nn.Linear = nn.Linear(config.decoder_input_size, config.n_embd)
 
+        # Optional magnitude normalisation of z (default off).
+        #
+        # z enters as a prefix token competing against fixed-scale token embeddings in a
+        # residual stream that is NOT normalised (only branch inputs are -- see the z_proj
+        # init note below). So the decoder's sensitivity to z depends on ||z||, which is an
+        # artifact of whatever the actor happened to learn rather than information.
+        #
+        # Measured on 24x24_empty (test 0.099) against 16x16_room_v1 (0.961), same config:
+        # the actor's z carried the SAME relative variety (std/norm 0.1246 vs 0.1306) at
+        # 2.7x smaller magnitude (norm 0.0782 vs 0.2079), and reached only 23% of the
+        # decoder's plan range against room's 43%. The actor had not collapsed; its z was
+        # simply too small to move the residual stream.
+        #
+        # This rescales z to a fixed norm instead of normalising per-dimension. A plain
+        # LayerNorm would force unit per-dim variance -- roughly 19x the working-map scale
+        # here -- which is far outside what the z_proj init below was tuned for. z_scale is
+        # learnable so training can move it, and initialised at a working map's measured
+        # norm so enabling the flag is close to a no-op where things already work.
+        self.normalize_z: bool = config.normalize_z
+        if self.normalize_z:
+            self.z_scale: nn.Parameter = nn.Parameter(torch.tensor(float(config.z_scale_init)))
+
         # Token and (learned) positional embeddings. ``+ 1`` position accounts for the
         # prefix conditioning token sitting in front of the real sequence.
         self.tok_emb: nn.Embedding = nn.Embedding(config.vocab_size, config.n_embd)
@@ -294,6 +321,19 @@ class GPT(nn.Module):
             nn.init.zeros_(module.bias)
             nn.init.ones_(module.weight)
 
+    def _project_z(self, z: torch.Tensor) -> torch.Tensor:
+        """Map ``z`` to the prefix token, optionally pinning its magnitude first.
+
+        With ``normalize_z`` off this is exactly ``z_proj(z)`` -- the historical path, so
+        every existing checkpoint and result is unaffected. With it on, ``z`` is rescaled to
+        a learnable fixed norm so the decoder's sensitivity depends on the latent's
+        *direction* rather than on however large the actor happened to make it. See the
+        __init__ note for the measurement that motivated this.
+        """
+        if self.normalize_z:
+            z = z / (z.norm(p=2, dim=-1, keepdim=True) + 1e-6) * self.z_scale
+        return self.z_proj(z)
+
     def forward(
         self,
         z: torch.Tensor,
@@ -320,7 +360,7 @@ class GPT(nn.Module):
         B = z.size(0)
 
         # Project the latent into a single prefix token: (B, 1, n_embd).
-        prefix = self.z_proj(z).unsqueeze(1)
+        prefix = self._project_z(z).unsqueeze(1)
 
         if idx is not None:
             T = idx.size(1)
@@ -412,7 +452,7 @@ class GPT(nn.Module):
             ``(logits, past)`` with logits ``(B, vocab_size)`` predicting the first action
             and ``past`` the initial per-layer cache.
         """
-        prefix = self.z_proj(z).unsqueeze(1)  # (B, 1, n_embd) -- prefix at position 0
+        prefix = self._project_z(z).unsqueeze(1)  # (B, 1, n_embd) -- prefix at position 0
         logits, past = self._forward_trunk(prefix, position_offset=0, use_cache=use_cache)
         return logits[:, -1, :], past
 

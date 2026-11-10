@@ -57,7 +57,8 @@ class DenseVAE(nn.Module):
     def __init__(self, input_length: int, n_words: int, device: torch.device,
                  variance_for_sample: int = 1, decoder_input_size: int = 16,
                  decoder_n_layer: int = 2, decoder_n_head: int = 4, decoder_n_embd: int = 32,
-                 decoder_dropout: Optional[float] = None):
+                 decoder_dropout: Optional[float] = None,
+                 decoder_normalize_z: bool = False, decoder_z_scale_init: float = 0.2):
         """
         Args:
             decoder_n_layer / decoder_n_head / decoder_n_embd: size of the Transformer
@@ -66,6 +67,10 @@ class DenseVAE(nn.Module):
                 is close to a linear knob on decoder wall-clock time.
             decoder_dropout: if given, overrides all three GPT dropout rates at once.
                 ``None`` keeps minGPT's own defaults.
+            decoder_normalize_z: rescale z to a fixed learnable norm before projecting it,
+                making the decoder sensitive to the latent's direction rather than its
+                magnitude. Off by default; see GPT.__init__ for the measurement behind it.
+            decoder_z_scale_init: the norm decoder_normalize_z targets at init.
         """
         super().__init__()
         self.decoder_input_size = decoder_input_size
@@ -104,6 +109,8 @@ class DenseVAE(nn.Module):
             n_layer=decoder_n_layer,
             n_head=decoder_n_head,
             n_embd=decoder_n_embd,
+            normalize_z=decoder_normalize_z,
+            z_scale_init=decoder_z_scale_init,
         )
         if decoder_dropout is not None:
             gpt_kwargs.update(

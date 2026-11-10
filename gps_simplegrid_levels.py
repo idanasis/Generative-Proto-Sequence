@@ -292,6 +292,18 @@ class Config:
        Defaults to 0 to match the old MLP decoder, which had no dropout at all: any
        non-zero value adds noise to generated action sequences on every path where the
        decoder is in train mode"""
+    decoder_normalize_z: bool = False
+    """rescale the actor's z to a fixed learnable norm before the decoder projects it to the
+       prefix token, so the decoder responds to z's *direction* rather than its magnitude.
+       z competes against fixed-scale token embeddings in an un-normalised residual stream,
+       so a small z is simply drowned out. On 24x24_empty (test 0.099) the actor's z carried
+       the same relative variety as on a working 16x16_room_v1 run (0.961) -- std/norm 0.1246
+       vs 0.1306 -- at 2.7x smaller magnitude, and reached only 23% of the decoder's plan
+       range against room's 43%. Off by default: every result in EVIDENCE.md predates it"""
+    decoder_z_scale_init: float = 0.2
+    """the norm decoder_normalize_z targets at init, learnable thereafter. 0.2 is the
+       measured z norm of a working run, so enabling the flag is near a no-op where things
+       already work and a ~2.7x boost on 24x24. Ignored unless decoder_normalize_z is set"""
     decoder_use_cuda_graph: bool = False
     """replay the decoder's autoregressive decode loop from a captured CUDA graph on the
        gradient-free paths (action selection, target-Q, evaluation). The loop issues ~550
@@ -1712,6 +1724,8 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                               deterministic_inference=cfg.deterministic_inference, load_pretrained_weights=load_pretrained_decoder,
                               decoder_n_layer=cfg.decoder_n_layer, decoder_n_head=cfg.decoder_n_head,
                               decoder_n_embd=cfg.decoder_n_embd, decoder_dropout=cfg.decoder_dropout,
+                              decoder_normalize_z=cfg.decoder_normalize_z,
+                              decoder_z_scale_init=cfg.decoder_z_scale_init,
                               decoder_use_cuda_graph=cfg.decoder_use_cuda_graph,
                               decoder_soft_token_feedback=cfg.decoder_soft_token_feedback)
     

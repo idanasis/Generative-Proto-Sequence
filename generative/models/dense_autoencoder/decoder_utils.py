@@ -374,12 +374,16 @@ def get_decoder_api(decoder_model_path: str, decoder_seq_len: int, device: torch
                     decoder_n_layer: int = 2, decoder_n_head: int = 4, decoder_n_embd: int = 32,
                     decoder_dropout: Optional[float] = None,
                     decoder_use_cuda_graph: bool = False,
-                    decoder_soft_token_feedback: bool = False) -> ActionGen:
+                    decoder_soft_token_feedback: bool = False,
+                    decoder_normalize_z: bool = False,
+                    decoder_z_scale_init: float = 0.2) -> ActionGen:
     decoder = get_decoder(decoder_f_name=decoder_model_path, decoder_seq_len=decoder_seq_len, device=device,
                           maze_n_actions=maze_n_actions, var_for_sample=var_for_sample,
                           load_pretrained_weights=load_pretrained_weights,
                           decoder_n_layer=decoder_n_layer, decoder_n_head=decoder_n_head,
-                          decoder_n_embd=decoder_n_embd, decoder_dropout=decoder_dropout)
+                          decoder_n_embd=decoder_n_embd, decoder_dropout=decoder_dropout,
+                          decoder_normalize_z=decoder_normalize_z,
+                          decoder_z_scale_init=decoder_z_scale_init)
     return ActionGen(pretrained_decoder=decoder, n_act_seq_len=decoder_seq_len, device=device,
                      maze_n_actions=maze_n_actions, use_gumble=use_gumble_in_decoder,
                      penalize_cyclic_position_revisits=penalize_cyclic_position_revisits,
@@ -391,11 +395,14 @@ def get_decoder_api(decoder_model_path: str, decoder_seq_len: int, device: torch
 def get_decoder(decoder_f_name: str, decoder_seq_len: int, device: torch.device, maze_n_actions: int,
                 var_for_sample: int = 1, load_pretrained_weights: bool = True,
                 decoder_n_layer: int = 2, decoder_n_head: int = 4, decoder_n_embd: int = 32,
-                decoder_dropout: Optional[float] = None):
+                decoder_dropout: Optional[float] = None,
+                decoder_normalize_z: bool = False, decoder_z_scale_init: float = 0.2):
     decoder = DenseVAE(input_length=decoder_seq_len, n_words=maze_n_actions + 1, device=device,
                        variance_for_sample=var_for_sample,
                        decoder_n_layer=decoder_n_layer, decoder_n_head=decoder_n_head,
-                       decoder_n_embd=decoder_n_embd, decoder_dropout=decoder_dropout).to(device)
+                       decoder_n_embd=decoder_n_embd, decoder_dropout=decoder_dropout,
+                       decoder_normalize_z=decoder_normalize_z,
+                       decoder_z_scale_init=decoder_z_scale_init).to(device)
     if load_pretrained_weights:
         # Load state dict directly to the correct device
         decoder.load_state_dict(torch.load(decoder_f_name, map_location=device))

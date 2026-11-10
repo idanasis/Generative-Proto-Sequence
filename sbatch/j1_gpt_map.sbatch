@@ -59,6 +59,23 @@ TRAIN_PAIRS="${3:-500}"
 # comparable against the MLP, which gets 1M everywhere. Check "best val mean global step" in
 # the log: within ~10% of the budget means the run was cut short and its score is a floor.
 TOTAL_STEPS="${4:-500000}"
+# 5th arg: pass 1 to enable --decoder_normalize_z. Everything else stays identical, so this
+# is a single-flag A/B against the corresponding run without it.
+#
+# Why: on 24x24_empty (0.110, n=2) the decoder is healthy and the actor has NOT collapsed --
+# its z carries the same relative variety as on a working map (std/norm 0.1246 vs 0.1306) at
+# 2.7x smaller magnitude (norm 0.0782 vs 0.2079). z enters as a prefix token competing with
+# fixed-scale token embeddings in an un-normalised residual stream, so a small z is drowned
+# out. This pins ||z|| to a learnable constant (init 0.2 = a working run's measured norm).
+#
+# PREDICTION: 24x24 recovers substantially; room/corridors/empty are unchanged, since their
+# z norm is already ~0.2. The regression runs are not a formality -- if a working map moves,
+# the flag is doing something other than what it was designed for.
+#
+# IF IT WINS, FLIP THE DEFAULT AND RE-RUN EVERY MAP. The MLP baseline ran one configuration
+# across all seven maps; reporting normalize_z on 24x24 only would be per-environment tuning
+# and would invalidate the comparison.
+NORMALIZE_Z="${5:-0}"
 
 if [ -z "${MAP}" ]; then
     echo "ERROR: pass the obstacle map, e.g."
@@ -70,13 +87,18 @@ fi
 
 # The length-band flags must be omitted entirely when the weight is 0: passing them with
 # the penalty disabled is harmless but misleading in the logged config.
+NORM_ARGS=()
+if [ "${NORMALIZE_Z}" != "0" ]; then
+    NORM_ARGS=(--decoder_normalize_z)
+fi
+
 LENGTH_ARGS=()
 if [ "${LENGTH_WEIGHT}" != "0" ]; then
     LENGTH_ARGS=(--sequence_length_weight "${LENGTH_WEIGHT}"
                  --min_lengths_per_head 4 --max_lengths_per_head 10)
 fi
 
-echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS} ==="
+echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS}  normalize_z=${NORMALIZE_Z} ==="
 
 START=$(date +%s)
 
@@ -99,6 +121,7 @@ poetry run python gps_simplegrid_levels.py \
     --min_qf_value -20.0 \
     --max_qf_value 1.0 \
     "${LENGTH_ARGS[@]}" \
+    "${NORM_ARGS[@]}" \
     --slurm_job_id "${SLURM_JOB_ID}"
 
 END=$(date +%s)
