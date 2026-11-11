@@ -53,6 +53,11 @@ HEADER = re.compile(
     r"^=== (?P<arm>J\d): map=(?P<map>\S+)(?:\s+length_weight=(?P<weight>\S+))?", re.MULTILINE
 )
 
+# train_pairs sits after length_weight on a J1 header and directly after map on a J2 one, so
+# it gets its own pattern. The pair count is NOT in the label by default -- it is added only
+# when the logs being compared actually mix pair counts, so existing labels stay short.
+HEADER_PAIRS = re.compile(r"^=== J\d:.*?train_pairs=(\d+)", re.MULTILINE)
+
 SIMPLE = {
     "best val success": re.compile(r"best val mean success=([\d.]+)"),
     "best val step": re.compile(r"best val mean global step=(\d+)"),
@@ -109,6 +114,9 @@ def parse(path: str) -> dict:
         if header.group("weight") == "0":
             arm += "/plain"       # the no-length-penalty arm, comparable to the MLP's
         out["_label"] = f"{name}:{arm}"
+        pairs = HEADER_PAIRS.search(text)
+        if pairs:
+            out["_pairs"] = pairs.group(1)
 
     for match in TEST_METRIC.finditer(text):
         suffix = " (det)" if match.group("det") else ""
@@ -156,6 +164,15 @@ def main() -> None:
         runs.append((data.pop("_label", None) or fallback, data))
     if not runs:
         sys.exit("no readable logs")
+
+    # Mixed training-set sizes in one table would otherwise be invisible: a 100-pair and a
+    # 500-pair run of the same map at the same budget collide under one heading. Only tag the
+    # labels when the set actually mixes, so the common single-size case stays readable.
+    sizes = {d.get("_pairs") for _, d in runs if d.get("_pairs")}
+    if len(sizes) > 1:
+        runs = [(f"{n}/{d.pop('_pairs')}p" if d.get("_pairs") else n, d) for n, d in runs]
+    for _, d in runs:
+        d.pop("_pairs", None)
 
     # Several runs of one map/arm -- a 500k and a 1M budget, or a repeated seed -- would
     # otherwise land under identical column headings. Disambiguate by step budget first
