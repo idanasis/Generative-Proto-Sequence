@@ -71,7 +71,48 @@ autoregressive shift, so no BOS token is needed.
 - `init_decode(z)` / `decode_step(token, past, position)` — cached incremental-decoding
   helpers (§6.1) used by `generate` and `ActionGen.gen_action_seq`.
 
-Model size at defaults: **~27K parameters** (was ~152K before the §6.3 shrink).
+### Size — and the surrounding stack
+
+| | |
+|---|---|
+| layers / heads / embedding width | **2 / 4 / 32** |
+| vocab size (4 actions + EOS) | 5 |
+| block size (max generated tokens) | 10 |
+| `decoder_input_size` (the latent `z`) | 16 |
+| **trainable parameters** | **26,688** |
+
+Printed in every run's log by the construction banner, so it is checkable per run — and
+useful for exactly that: `--decoder_normalize_z` adds one parameter, so **26,689** in a log
+is how you confirm that flag actually reached the model.
+
+Decoder variants, for comparison:
+
+| configuration | params | |
+|---|---|---|
+| `n_layer=1, n_embd=32` | 13,984 | |
+| **`n_layer=2, n_embd=32`** | **26,688** | current default |
+| `n_layer=3, n_embd=64` | 152,512 | minGPT-ish size, before the §6.3 shrink |
+| the MLP decoder it replaced | ~2,500 | |
+
+**The decoder is a very small part of the agent.** The actor CNN, which both decoders share,
+dwarfs it — and its size is driven entirely by the observation grid, because the trunk is
+three 2×2 stride-1 convolutions (a **4×4 receptive field**, no pooling) feeding a flatten
+into `512 → 128 → 32`:
+
+| actor CNN, by observation size | params | decoder as a share |
+|---|---|---|
+| 8x8 | 1,031,648 | 2.6% |
+| **16x16** | **5,750,240** | **0.46%** |
+| **24x24** | **14,663,136** | **0.18%** |
+
+Two consequences worth stating when reporting:
+
+- **"Transformer vs MLP" here compares two tiny sequence heads on a much larger perception
+  stack.** It is not a model-scale result, and neither decoder is where the parameters are.
+- **The actor grows 2.6× from 16x16 to 24x24**, almost all of it in the first linear layer.
+  That is shared by both arms so it cannot by itself explain the 24x24 gap (§10) — but it is
+  a plausible reason the actor's `z` comes out 2.7× smaller in magnitude there, which is the
+  measured proximate cause.
 
 ---
 
@@ -996,27 +1037,40 @@ wall-clock per optimal step, because it needs 4× fewer. **This result does not 
 unmodified paper tree at `6f627a2`), 500 pairs, all seven maps the repo ships. The paper
 evaluates 9; both 24x24 obstacle maps are absent here.
 
-| map | coverage | **GPT** | **MLP** | gap | GPT best-val step |
-|---|---|---|---|---|---|
-| 16x16_corridors_v1 | 28.1% | 0.990 | 0.982 | **+0.008** | ~200k |
-| 8x8_empty | 24.8% | 1.000 | 1.000 | 0.000 | 425,000 |
-| 16x16_empty | 3.1% | 0.990 | 1.000 | −0.010 | 425,000 |
-| 16x16_room_v1 | 5.8% | 0.838 | 0.980 | −0.142 | **499,999** ⚠ |
-| 16x16_obstacles_v1_15p | 4.4% | 0.824 | 0.987 | −0.163 | 470,000 ⚠ |
-| 16x16_obstacles_v1_25p | 6.7% | 0.505 | 0.953 | −0.448 | **499,999** ⚠ |
-| 24x24_empty | 0.8% | 0.120 | 0.973 | −0.853 | 295,000 |
+**Final, at matched 1M budgets** (`RESULTS.md` Table 1 is the canonical copy):
 
-**The MLP sits at 0.95–1.00 on every map. Corridors is the single map where the Transformer
-wins, and it is the map this entire investigation ran on.**
+| map | coverage | **GPT** | **MLP** | gap | GPT gen/ep | MLP gen/ep | GPT ratio | MLP ratio |
+|---|---|---|---|---|---|---|---|---|
+| 8x8_empty | 24.8% | 1.000 | 1.000 | 0.000 | **2.19** | 3.92 | **0.977** | 0.934 |
+| 16x16_empty | 3.1% | 0.994 | 1.000 | −0.006 | **3.42** | 5.73 | **0.946** | 0.889 |
+| 16x16_corridors_v1 | 28.1% | **0.990** | 0.982 | **+0.008** | **3.36** | 13.34 | **0.936** | 0.573 |
+| 16x16_obstacles_v1_15p | 4.4% | 0.949 | 0.987 | −0.038 | **4.98** | 10.66 | 0.755 | **0.825** |
+| 16x16_room_v1 | 5.8% | 0.945 | 0.980 | −0.035 | **4.56** | 11.56 | **0.805** | 0.774 |
+| 16x16_obstacles_v1_25p | 6.7% | 0.915 | 0.953 | −0.038 | **4.83** | 13.66 | **0.785** | 0.701 |
+| **24x24_empty** | 0.8% | **0.110** | **0.973** | **−0.863** | 7.16 | 12.40 | 0.640 | **0.717** |
+
+**Success is within 0.04 on six of seven maps, with 2–3× fewer decisions per episode on
+every map and better path optimality on five of seven. One complete failure, 24x24_empty.**
+
+> ⚠ **An earlier version of this section read the opposite** — "the MLP sits at 0.95–1.00 on
+> every map; corridors is the single map where the Transformer wins." That was measured at
+> `--total_timesteps 500000`, a budget validated on corridors (validation peaks ~200k) that
+> **does not transfer**. Three cells hit the budget wall still improving (best validation at
+> 470,000–499,999) and recovered when re-run at 1M:
+>
+> | map | @500k | **@1M** | recovered |
+> |---|---|---|---|
+> | 16x16_room_v1 | 0.838 | **0.945** | +0.107 |
+> | 16x16_obstacles_v1_15p | 0.824 | **0.949** | +0.125 |
+> | 16x16_obstacles_v1_25p | 0.505 | **0.915** | **+0.410** |
+>
+> **Always check `best val mean global step` against the budget before interpreting a
+> score.** Within ~10% of it means the run was cut short and the number is a floor. `j1`
+> takes the budget as a 4th argument. 24x24 is genuinely not truncated (peak 295k, then
+> decline).
 
 Coverage does **not** order this table — the MLP reaches 0.973 on 24x24_empty at 0.8%
 coverage. Neither decoder is coverage-limited in this range.
-
-⚠ **Three GPT runs were truncated.** `--total_timesteps 500000` was validated on corridors,
-where validation peaks ~200k. On room and obstacles_25p the best validation is at step
-**499,999** — still improving at the budget wall — and obstacles_15p at 470,000. Those three
-gaps are upper bounds. `j1` now takes `total_steps` as a 4th argument; 1M re-runs are in
-flight. 24x24 is **not** truncated (peak 295k, then decline) — that one is a real failure.
 
 ### 10.4 The mechanism — a fixed 3-action plan
 
@@ -1063,9 +1117,18 @@ regulariser is the problem; if it stays at 3.000, the rigidity is in the decoder
 
 **Runtime: resolved** (§7). 50.3 h → 3–7 h per 500k run depending on the map.
 
-**Accuracy: the Transformer decoder is not competitive with the MLP off corridors.** Six of
-seven maps favour the MLP, three of those by truncated margins pending the 1M re-runs. The
-proximate cause is named and measurable: a fixed 3.000-action plan regardless of state.
+**Accuracy: near-parity at matched budgets, with one failure.** Success is within 0.04 on six
+of seven maps (the −0.035/−0.038 cells sit inside the 0.019–0.042 noise floor against a
+single-seed MLP), and the Transformer replans **2–3× less often on every map** with better
+path optimality on five of seven. `24x24_empty` fails outright, 0.110 vs 0.973 across two
+seeds.
+
+*An earlier version of this paragraph said the Transformer "is not competitive off
+corridors." That was the truncated 500k reading — see the warning in §10.3.*
+
+**The open mechanism is unchanged by that correction: a fixed 3.000-action plan regardless
+of state.** It is what buys the decision-count advantage and what costs path directness on
+cluttered maps.
 
 **What a fix would have to look like.** A policy that commits to 3 actions whether it is in
 a corridor or a cluttered room is doing fixed-stride, not sequence-level, decision making.
