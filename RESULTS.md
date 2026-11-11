@@ -38,17 +38,34 @@ every map**; better path optimality on five of seven. One complete failure, `24x
 
 Both arms 1M steps. The paper's protocol pair count.
 
-| map | coverage | GPT | MLP | gap |
-|---|---|---|---|---|
-| 16x16_empty | 0.6% | 0.520 | **0.930** | −0.410 |
-| 16x16_obstacles_v1_15p | 0.9% | 0.497 | **0.636** | −0.139 |
-| 16x16_room_v1 | 1.2% | 0.515 | 0.507 | +0.008 |
-| 16x16_obstacles_v1_25p | 1.3% | **0.487** | 0.399 | **+0.088** |
-| **range** | | **0.033** | **0.531** | |
+| map | cov. | success |  | decoder generations / ep |  |  | agent step ratio |  | revisits (global) |  |
+|---|---|---|---|---|---|---|---|---|---|---|
+| | | **GPT** | MLP | **GPT** | MLP | **red.** | **GPT** | MLP | **GPT** | MLP |
+| 16x16_empty | 0.6% | 0.520 | **0.930** | **6.88** | 8.47 | 1.2× | 0.744 | **0.762** | **1.72** | 1.19 |
+| 16x16_obstacles_v1_15p | 0.9% | 0.497 | **0.636** | **7.13** | 19.16 | **2.7×** | **0.641** | 0.561 | **1.85** | 3.38 |
+| 16x16_room_v1 | 1.2% | 0.515 | 0.507 | **6.93** | 24.21 | **3.5×** | **0.650** | 0.452 | **1.86** | 4.37 |
+| 16x16_obstacles_v1_25p | 1.3% | 0.487 ⚠ | 0.399 | **6.55** | 23.04 | **3.5×** | **0.643** | 0.366 | **1.44** | 4.70 |
+| **range** | | **0.033** | **0.531** | **0.58** | **15.74** | | **0.103** | **0.396** | | |
 
-**Read:** 2–2 on wins, but the *variance* is the finding. The GPT's spread across four maps
-(0.033) is below the 0.042 noise floor — it is insensitive to map difficulty. The MLP tracks
-difficulty as a navigating policy should.
+**Read:** success is 2–2, but the efficiency columns are not close. **The GPT replans 2.7–3.5×
+less often on the three cluttered maps, follows more direct paths on three of four, and
+wanders 2–3× less** — while scoring lower on success for two of them. The advantage is
+*larger* at 100 pairs than at 500 (Table 1), because the MLP degrades badly here.
+
+The *variance* is the second finding. The GPT is flat on every axis — success spread 0.033
+(below the 0.042 noise floor), generations/ep spread 0.58, step ratio 0.103 — across an open
+grid and 25% clutter. The MLP's spreads are 0.531, 15.74 and 0.396. The GPT is insensitive
+to map difficulty; the MLP tracks it as a navigating policy should.
+
+Plan length is **3.000 on every GPT cell here too** (3.001/3.000/3.001/3.000) against the
+MLP's 1.14–1.85 — the same constant as at 500 pairs.
+
+⚠ `obstacles_25p:gpt` hit a non-finite gradient and aborted at step 780,500 of 1M; 0.487 is
+its best-on-validation checkpoint. Best validation was at 330k and declining after, so the
+abort probably cost nothing, but the cell is not a completed run.
+
+`empty:mlp` reached its best validation at step **965,000** — still improving at the budget
+wall, so its 0.930 is a lower bound.
 
 "Coverage" is the share of each map's level-1–14 train pool that the pair count buys; it
 differs per map because the maps differ in free space. See Table 5.
