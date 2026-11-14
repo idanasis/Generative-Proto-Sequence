@@ -115,6 +115,7 @@ def main() -> None:
         decoder_n_layer=cfg.decoder_n_layer,
         decoder_n_head=cfg.decoder_n_head,
         decoder_n_embd=cfg.decoder_n_embd,
+        decoder_z_all_positions=cfg.decoder_z_all_positions,
         decoder_dropout=cfg.decoder_dropout,
         decoder_use_cuda_graph=cfg.decoder_use_cuda_graph,
     )

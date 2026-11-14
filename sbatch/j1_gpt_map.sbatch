@@ -59,6 +59,24 @@ TRAIN_PAIRS="${3:-500}"
 # comparable against the MLP, which gets 1M everywhere. Check "best val mean global step" in
 # the log: within ~10% of the budget means the run was cut short and its score is a floor.
 TOTAL_STEPS="${4:-500000}"
+# 5th arg: pass 1 to enable --decoder_z_all_positions. Single-flag A/B against the matching
+# run without it.
+#
+# Why: z enters the decoder once, as the prefix token, so its influence on a late token is
+# mediated by the accumulating token history and small differences between similar z wash
+# out. The MLP decoder had no such bottleneck -- one linear layer mapped z to all 50 logits.
+# Measured: the decoder gives 60-64 distinct plans out of 256 from a wide random z but only
+# 15-26 from the actor's real z (std/norm ~= 0.12, nearly constant). Open maps suffer most,
+# because they need the most distinct plans; corridors suffers least, which is why the
+# method looked fine there.
+#
+# FIRST TEST: 16x16_empty at 100 pairs, where the gap is 0.520 vs the MLP's 0.930 and the
+# plan-repertoire limit should bind hardest. Mechanism check afterwards with
+# check_z_influence.py -- "plans reached from actor z" should rise above 15-26/256.
+#
+# Adds no parameters (reuses z_proj). Verified off is bit-identical to the historical path,
+# and that cached decode matches the full forward when on (6e-08).
+Z_ALL_POSITIONS="${5:-0}"
 
 if [ -z "${MAP}" ]; then
     echo "ERROR: pass the obstacle map, e.g."
@@ -70,13 +88,18 @@ fi
 
 # The length-band flags must be omitted entirely when the weight is 0: passing them with
 # the penalty disabled is harmless but misleading in the logged config.
+ZPOS_ARGS=()
+if [ "${Z_ALL_POSITIONS}" != "0" ]; then
+    ZPOS_ARGS=(--decoder_z_all_positions)
+fi
+
 LENGTH_ARGS=()
 if [ "${LENGTH_WEIGHT}" != "0" ]; then
     LENGTH_ARGS=(--sequence_length_weight "${LENGTH_WEIGHT}"
                  --min_lengths_per_head 4 --max_lengths_per_head 10)
 fi
 
-echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS} ==="
+echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS}  z_all_positions=${Z_ALL_POSITIONS} ==="
 
 START=$(date +%s)
 
@@ -99,6 +122,7 @@ poetry run python gps_simplegrid_levels.py \
     --min_qf_value -20.0 \
     --max_qf_value 1.0 \
     "${LENGTH_ARGS[@]}" \
+    "${ZPOS_ARGS[@]}" \
     --slurm_job_id "${SLURM_JOB_ID}"
 
 END=$(date +%s)

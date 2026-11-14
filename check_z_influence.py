@@ -115,6 +115,7 @@ def main() -> None:
             load_pretrained_weights=False,
             decoder_n_layer=cfg.decoder_n_layer, decoder_n_head=cfg.decoder_n_head,
             decoder_n_embd=cfg.decoder_n_embd, decoder_dropout=cfg.decoder_dropout,
+            decoder_z_all_positions=cfg.decoder_z_all_positions,
         )
 
     print("=" * 78)

@@ -55,6 +55,18 @@ class GPTConfig:
     embd_pdrop: float = 0.1
     resid_pdrop: float = 0.1
     attn_pdrop: float = 0.1
+    z_all_positions: bool = False
+    """add the projected z to every token embedding, not only the prefix at position 0.
+
+    Default off. z normally enters once, as the prefix, so its influence on a late token is
+    mediated by the whole accumulating token history -- which washes out small differences
+    between similar z. The MLP decoder this replaced had no such bottleneck: one linear layer
+    mapped z to all 50 logits, so a near-identical z still perturbed every position.
+
+    That asymmetry is measurable. The decoder produces 60-64 distinct plans out of 256 when
+    fed z from a wide random prior, but only 15-26 when fed the actor's real z, whose
+    scale-free spread is std/norm ~= 0.12 (nearly constant). Open maps suffer most, because
+    they need the most distinct plans; corridors suffers least."""
 
 
 class CausalSelfAttention(nn.Module):
@@ -204,6 +216,7 @@ class GPT(nn.Module):
         # --- Latent conditioning: project z into the Transformer's embedding space. ---
         # The result is treated as the first ("prefix") token of the sequence.
         self.z_proj: nn.Linear = nn.Linear(config.decoder_input_size, config.n_embd)
+        self.z_all_positions: bool = config.z_all_positions
 
         # Token and (learned) positional embeddings. ``+ 1`` position accounts for the
         # prefix conditioning token sitting in front of the real sequence.
@@ -328,6 +341,11 @@ class GPT(nn.Module):
                 f"Sequence length {T} exceeds block size {self.block_size}"
             )
             token_embeddings = self.tok_emb(idx)  # (B, T, n_embd)
+            if self.z_all_positions:
+                # Broadcast the (B, 1, n_embd) prefix across all T real positions. The prefix
+                # itself is left alone -- it already *is* the projected z, and adding it there
+                # would double it at position 0.
+                token_embeddings = token_embeddings + prefix
             # Concatenate prefix in front of the real tokens.
             x = torch.cat([prefix, token_embeddings], dim=1)  # (B, T + 1, n_embd)
         else:
@@ -422,6 +440,7 @@ class GPT(nn.Module):
         past_key_values: Optional[list],
         position: int,
         use_cache: bool = True,
+        z: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[list]]:
         """Advance cached decoding by one token.
 
@@ -446,6 +465,17 @@ class GPT(nn.Module):
             token_embeddings = (tokens @ self.tok_emb.weight).unsqueeze(1)
         else:
             token_embeddings = self.tok_emb(tokens.view(-1, 1))  # (B, 1, n_embd)
+
+        if self.z_all_positions:
+            # This path is cached, so z is not otherwise in scope -- callers must pass it.
+            # Failing loudly beats silently degrading to prefix-only conditioning, which
+            # would look like the flag doing nothing rather than like a bug.
+            if z is None:
+                raise ValueError(
+                    "decode_step needs z when z_all_positions is set; pass z=... from the "
+                    "generation loop (see ActionGen._generate)."
+                )
+            token_embeddings = token_embeddings + self.z_proj(z).unsqueeze(1)
         logits, past = self._forward_trunk(
             token_embeddings,
             position_offset=position,
@@ -498,6 +528,7 @@ class GPT(nn.Module):
             generated.append(next_token)
             if step < max_new_tokens - 1:
                 # The token just produced sits at absolute position ``step + 1``.
-                logits, past = self.decode_step(next_token, past, position=step + 1, use_cache=True)
+                logits, past = self.decode_step(next_token, past, position=step + 1,
+                                                use_cache=True, z=z)
 
         return torch.cat(generated, dim=1)

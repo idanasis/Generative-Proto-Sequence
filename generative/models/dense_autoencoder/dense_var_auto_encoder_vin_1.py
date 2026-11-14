@@ -57,7 +57,8 @@ class DenseVAE(nn.Module):
     def __init__(self, input_length: int, n_words: int, device: torch.device,
                  variance_for_sample: int = 1, decoder_input_size: int = 16,
                  decoder_n_layer: int = 2, decoder_n_head: int = 4, decoder_n_embd: int = 32,
-                 decoder_dropout: Optional[float] = None):
+                 decoder_dropout: Optional[float] = None,
+                 decoder_z_all_positions: bool = False):
         """
         Args:
             decoder_n_layer / decoder_n_head / decoder_n_embd: size of the Transformer
@@ -104,6 +105,7 @@ class DenseVAE(nn.Module):
             n_layer=decoder_n_layer,
             n_head=decoder_n_head,
             n_embd=decoder_n_embd,
+            z_all_positions=decoder_z_all_positions,
         )
         if decoder_dropout is not None:
             gpt_kwargs.update(

@@ -292,6 +292,16 @@ class Config:
        Defaults to 0 to match the old MLP decoder, which had no dropout at all: any
        non-zero value adds noise to generated action sequences on every path where the
        decoder is in train mode"""
+    decoder_z_all_positions: bool = False
+    """add the projected latent z to every token embedding instead of only to the prefix
+       token at position 0. z normally enters once, so its influence on a late token is
+       mediated by the whole accumulating token history, which washes out small differences
+       between similar z. The MLP decoder had no such bottleneck -- one linear layer mapped z
+       to all 50 logits, so a near-identical z still perturbed every position. Measured: the
+       decoder gives 60-64 distinct plans out of 256 from a wide random z but only 15-26 from
+       the actor's real z (scale-free spread std/norm ~= 0.12). Open maps suffer most because
+       they need the most distinct plans. Off by default; every result in EVIDENCE.md
+       predates it"""
     decoder_use_cuda_graph: bool = False
     """replay the decoder's autoregressive decode loop from a captured CUDA graph on the
        gradient-free paths (action selection, target-Q, evaluation). The loop issues ~550
@@ -1712,6 +1722,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                               deterministic_inference=cfg.deterministic_inference, load_pretrained_weights=load_pretrained_decoder,
                               decoder_n_layer=cfg.decoder_n_layer, decoder_n_head=cfg.decoder_n_head,
                               decoder_n_embd=cfg.decoder_n_embd, decoder_dropout=cfg.decoder_dropout,
+                              decoder_z_all_positions=cfg.decoder_z_all_positions,
                               decoder_use_cuda_graph=cfg.decoder_use_cuda_graph,
                               decoder_soft_token_feedback=cfg.decoder_soft_token_feedback)
     
