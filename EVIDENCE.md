@@ -372,7 +372,7 @@ under-powered — D4 tests a 4× weight.
 | `compare_runs.py` | **The reporting tool.** Parses both trees' logs for the full GPS metric set — decoder generations, agent step ratio, valid/unused actions, revisits, timing — and prints them side by side. `--csv` to write. Flags runs that died before their final eval rather than presenting partial numbers as comparable. |
 | `sbatch/g1`–`g2_train_data_*.sbatch` | 300 / 500 training pairs. **The experiment that resolved the whole investigation** — see §1.1. |
 | `sbatch/g3_d8_repeat.sbatch` | Second seed of length 4e-3 — decides whether the reportable figure is 0.726 or ~0.74. |
-| `sbatch/g4_multihead_clipped.sbatch` | Multi-head retry with Q clipping and actor clipping, the guards A1–A3 lacked. |
+| `sbatch/g4_multihead_clipped.sbatch` | Multi-head retry with Q clipping and actor clipping, the guards A1–A3 lacked. **Diverged anyway** — aborted on a non-finite gradient at step 143,000 of 500k. See §6: multi-head is refuted. |
 | `sbatch/h1`/`h2_mlp_*pairs.sbatch` | The MLP at 500 / 300 pairs — the matched-data baseline for g2 / g1. |
 | `sbatch/i1`–`i3_empty_*.sbatch` | `16x16_empty` at 100 pairs. Superseded by the `j`-series at 500; run them only for a paper-protocol comparison. |
 | **`sbatch/j1_gpt_map.sbatch`**, **`j2_mlp_map.sbatch`** | **Parameterised by map** — the multi-environment sweep (§8). `j1 <map> [length_weight] [pairs] [total_steps]`, `j2 <map> [pairs]`; both default to 500 pairs, j1 to 500k steps. `j1 <map> 0` is the no-length-penalty arm; `j1 <map> 0.002 500 1000000` matches the MLP's budget. |
@@ -386,11 +386,29 @@ test evaluations are logging only.
 
 ## 6. Parked, with reasons — do not re-propose without reading these
 
-- **Multi-head (`n_proto_plan_candidates > 1`)** — *untested, not refuted*. The three runs
-  that tried it were diverging from step 60k, so they measured instability. Worth one retry
-  now that `--min_qf_value` exists.
-- **`z` at every position** (instead of prefix-only conditioning) — plausible, but §4 Part A
-  shows the decoder already responds well to `z`. It strengthens something that works.
+- **Multi-head (`n_proto_plan_candidates > 1`)** — **REFUTED, 4 runs for 4 divergences.**
+  A1/A2/A3 peaked ~60k and NaN'd; `g4`, the retry *with* `--min_qf_value` and actor clipping,
+  peaked at 95k and aborted on a non-finite gradient at step **143,000** of 500k. The Q clip
+  does not fix it. And the partial run is not merely unstable, it is worse on every axis —
+  against `d6` on the same map and data: success **0.543 vs 0.709**, decoder generations/ep
+  **17.59 vs 4.50**, plan length **1.53 vs 3.02**, step ratio **0.539 vs 0.81**, global
+  revisits **3.688 vs 0.386**. It destroys exactly the sequence-level behaviour that makes
+  the Transformer worth having. Do not retry without a different stabiliser (double-Q for the
+  maximisation bias in the Bellman `argmax`, §3), and note the score is a best-checkpoint
+  value from a 29%-complete run.
+  *It was proposed as a fix for the plan-repertoire limit — more heads, more distinct plans.
+  It delivers the opposite: shorter plans and 4× more decisions.*
+- **`z` at every position** (instead of prefix-only conditioning) — **the leading untried
+  lever; its parking rationale was wrong.** It was parked because "§4 Part A shows the
+  decoder already responds well to `z`" — but **Part A feeds `z` from a wide random prior,
+  and the operating regime is `std/norm ≈ 0.12`, i.e. nearly constant `z`.** Part A never
+  tested the regime the decoder actually runs in. The measurement that matters: the decoder
+  produces **60–64/256** distinct plans from random `z` but only **15–26/256** from the
+  actor's. §8.6's explanation (a) predicts exactly this — the MLP maps `z` → all 50 logits in
+  one linear layer so a near-identical `z` still perturbs every position, while the
+  Transformer's autoregressive chain washes small differences out against accumulating token
+  history, since `z` enters once as a prefix. Unlike `--decoder_normalize_z` (§10) this adds
+  influence without discarding magnitude, which room's regression showed is state information.
 - **`--include_actor_embedding_in_critic_input`** (direct `dQ/dz`) — needs two fixes first:
   four call sites unpack 5 values from `DenseVAE.forward`, which returns 4; and those calls
   encode sub-sequences with the VAE **encoder**, which gets no gradient in from-scratch E2E
