@@ -1,11 +1,13 @@
 #!/bin/bash
 # J1 -- Transformer decoder on any map.  Parameterised: the map is an argument.
 #
-#   sbatch sbatch/j1_gpt_map.sbatch <map> [length_weight] [train_pairs] [total_steps]
+#   sbatch sbatch/j1_gpt_map.sbatch <map> [length_weight] [train_pairs] [total_steps] \
+#                                   [z_all_positions] [n_layer] [n_head] [n_embd]
 #
 #   sbatch sbatch/j1_gpt_map.sbatch 16x16_obstacles_v1_25p                     # tuned (0.002)
 #   sbatch sbatch/j1_gpt_map.sbatch 16x16_obstacles_v1_25p 0                   # plain, no penalty
 #   sbatch sbatch/j1_gpt_map.sbatch 16x16_obstacles_v1_25p 0.002 500 1000000   # 1M, matches the MLP
+#   sbatch sbatch/j1_gpt_map.sbatch 16x16_empty 0.002 100 1000000 0 1 4 16     # small decoder
 #
 # The paper evaluates 9 environments; this repo ships 7 of them (both 24x24 obstacle maps
 # are absent):
@@ -78,6 +80,28 @@ TOTAL_STEPS="${4:-500000}"
 # and that cached decode matches the full forward when on (6e-08).
 Z_ALL_POSITIONS="${5:-0}"
 
+# 6th-8th args: decoder trunk shape. Defaults 2/4/32 reproduce every run before 2026-11-15
+# bit-for-bit, so this is a no-op unless set.
+#
+# Why: the decoder we are replacing has 2,466 parameters. Ours has 26,688 -- 10.8x larger --
+# and needs ~5x the training pairs to match it (Table 3: MLP saturates at 300 pairs, GPT
+# needs 500). Those are plausibly the same fact: more parameters fitted from the same RL
+# signal. Nothing has ever tested a smaller trunk.
+#
+#   n_layer n_head n_embd   params   vs MLP
+#         2      4     32   26,688    10.8x   <- current
+#         1      4     32   13,984     5.7x
+#         2      4     16    7,200     2.9x
+#         1      4     16    3,920     1.6x
+#         1      2      8    1,192     0.5x
+#
+# n_head must divide n_embd. Test on 16x16_empty at 100 pairs, where the gap to the MLP is
+# widest in the whole result set (0.520 vs 0.930) and a data-efficiency effect should bind
+# hardest.
+DECODER_N_LAYER="${6:-2}"
+DECODER_N_HEAD="${7:-4}"
+DECODER_N_EMBD="${8:-32}"
+
 if [ -z "${MAP}" ]; then
     echo "ERROR: pass the obstacle map, e.g."
     echo "  sbatch $0 16x16_obstacles_v1_25p"
@@ -99,7 +123,7 @@ if [ "${LENGTH_WEIGHT}" != "0" ]; then
                  --min_lengths_per_head 4 --max_lengths_per_head 10)
 fi
 
-echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS}  z_all_positions=${Z_ALL_POSITIONS} ==="
+echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS}  z_all_positions=${Z_ALL_POSITIONS}  decoder=${DECODER_N_LAYER}L/${DECODER_N_HEAD}H/${DECODER_N_EMBD}E ==="
 
 START=$(date +%s)
 
@@ -121,6 +145,9 @@ poetry run python gps_simplegrid_levels.py \
     --n_proto_plan_candidates 1 \
     --min_qf_value -20.0 \
     --max_qf_value 1.0 \
+    --decoder_n_layer "${DECODER_N_LAYER}" \
+    --decoder_n_head "${DECODER_N_HEAD}" \
+    --decoder_n_embd "${DECODER_N_EMBD}" \
     "${LENGTH_ARGS[@]}" \
     "${ZPOS_ARGS[@]}" \
     --slurm_job_id "${SLURM_JOB_ID}"

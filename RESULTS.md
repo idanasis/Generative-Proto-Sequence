@@ -24,10 +24,26 @@ GPT at its best budget (1M where it was still improving at 500k); MLP at 1M thro
 | 16x16_obstacles_v1_15p | 0.949 | 0.987 | **4.98** | 10.66 | **2.1×** | 0.755 | **0.825** | 3.00 | 1.09 |
 | 16x16_room_v1 | 0.945 | 0.980 | **4.56** | 11.56 | **2.5×** | **0.805** | 0.774 | 3.00 | 1.13 |
 | 16x16_obstacles_v1_25p | 0.915 | 0.953 | **4.83** | 13.66 | **2.8×** | **0.785** | 0.701 | 3.00 | 1.12 |
-| **24x24_empty** | **0.110** | **0.973** | 7.16 | 12.40 | 1.7× | 0.640 | **0.717** | 2.99 | 1.26 |
+| ~~24x24_empty~~ ⛔ | ~~0.110~~ | ~~0.973~~ | 7.16 | 12.40 | 1.7× | 0.640 | 0.717 | 2.99 | 1.26 |
 
-**Read:** success within 0.04 on six of seven maps; **2–3× fewer decisions per episode on
-every map**; better path optimality on five of seven. One complete failure, `24x24_empty`.
+⛔ **`24x24_empty`: the 0.110/0.973 pair above is budget-mismatched (GPT 500k, MLP 1M), but
+the failure is real.** Two 1M runs settle it — 700 pairs → **0.115**, 1,879 pairs → **0.128**,
+against 0.110 at 500 pairs and 500k. Doubling the budget and near-quadrupling the data moves
+nothing. Quote 0.115–0.128 (1M) rather than 0.110, and see §"Why 24x24 fails" below.
+
+The 1,879-pair run is the decisive one, because it is **coverage-matched** to the
+`16x16_empty` cell that scores 0.994:
+
+| map | pairs | train pool | coverage | budget | success |
+|---|---|---|---|---|---|
+| 16x16_empty | 500 | 16,380 | 3.05% | 1M | **0.994** |
+| 24x24_empty | 1,879 | 60,620 | 3.10% | 1M | **0.128** |
+
+Same coverage, same budget, same decoder, same actor, both empty maps. Data and budget are
+eliminated as explanations.
+
+**Read:** success within 0.04 on all six valid maps; **2–3× fewer decisions per episode on
+every map**; better path optimality on five of six.
 
 `n=2` for `16x16_room_v1` (0.961, 0.929), `16x16_obstacles_v1_25p` (0.924, 0.905) and
 `24x24_empty` (0.120, 0.099); `n=1` elsewhere. MLP is `n=1` throughout.
@@ -100,6 +116,10 @@ differs per map because the maps differ in free space. See Table 5.
 **Read:** the penalty is load-bearing, not a source of rigidity. Plan length is a **constant
 either way** — 1.000 without it, 3.000 with it, on every map — never state-dependent.
 
+Both arms are 500k, so the *comparison* is matched and the conclusion holds, but by caveat 7
+every absolute number in this table is a lower bound. The tuned column understates what 1M
+would give (compare `obstacles_25p` 0.505 here against 0.915 at 1M in Table 1).
+
 ---
 
 ## Table 5 — dataset coverage by map
@@ -141,6 +161,39 @@ residual stream and absorbs a uniform rescale in its weights.
 
 ---
 
+## Why `24x24_empty` fails — hypothesis, not yet a result
+
+Ruled out by direct measurement: **data coverage** (3.10% vs 3.05% matched, Table 1 ⛔),
+**training budget** (1M changes nothing), **decoder capacity** (64/256 unique plans from
+random `z`, the healthiest of any map, Table 6), **`z` magnitude** (the decoder is pre-LN
+with a learned `z_proj`, so any uniform rescale of `z` is absorbed — which is why
+`--decoder_normalize_z` left the map at 0.18), **episode budget** (`max_episode_steps` is
+75 and `max_level` is 14 on *every* map, so path lengths and step budgets are identical),
+and **the task** (the MLP reaches 0.973 on the same map through the same actor).
+
+Note what that last row implies: 24x24 is not a harder navigation problem. `max_level 14`
+means the same ≤14-step paths as 16x16 — just scattered over 484 free cells instead of 196.
+
+What remains is **latent resolution**. The latent is 16-D (`actor_n_output_channels`, and
+`DenseVAE.decoder_input_size`, both 16). On 24x24 the actor must separate 3.7× more
+situations (train pool 60,620 vs 16,380) while its `z` occupies measurably the *same*
+latent volume as on a working map — `std/norm` 0.1246 vs 0.1306, mean pairwise cosine
+0.7746 vs 0.7639 (Table 6). Adjacent states collapse onto one `z`, decode to one plan, and
+the agent moves wrongly. Hence 15/256 plans reached from actor `z` against the decoder's
+own 64/256.
+
+This predicts the MLP's survival from its *weakness*: its plan length is 1.26 against the
+GPT's 3.00, so its latent must resolve 4 outcomes rather than 64 — ~16× coarser. On this
+reading the replanning advantage (Table 1) and the 24x24 failure are one phenomenon.
+
+**The test.** Run 24x24 at 1M with `--sequence_length_weight 0`, which drives GPT plan
+length to ~1.01 (Table 4). If it then reaches ~0.9, the mechanism is confirmed. If it stays
+near 0.14, this explanation is dead. Table 4's existing 0.141 for that config is **500k**
+and by caveat 7 says nothing. The follow-up fix, if confirmed, is a wider latent
+(`--actor_n_output_channels 64` plus plumbing `decoder_input_size` through `get_decoder`).
+
+---
+
 ## Caveats to carry into any write-up
 
 1. **500 pairs is not the paper's protocol** (100). Table 2 gives the 100-pair numbers; no
@@ -157,20 +210,64 @@ residual stream and absorbs a uniform rescale in its weights.
    so the −0.035/−0.038 gaps in Table 1 are not distinguishable from ties.
 6. **Deterministic inference** costs ~0.10 normally but 0.33–0.39 at 100 pairs, where the
    policy leans on sampling noise. Report which pass you are quoting.
-7. **Training budgets differ by cell in Table 1.** The MLP gets 1M steps everywhere. The GPT
-   gets 1M on `16x16_empty`, `room_v1` and both obstacle maps — the cells where a 500k run
-   was still improving at its budget wall (best validation at 470k–499,999) — and 500k on
-   `8x8_empty`, `corridors` and `24x24_empty`, where it had already converged (best
-   validation at 425k, ~200k and 230k–295k respectively, followed by decline). Giving those
-   three 1M would not change them. The 500k figures for the other four were materially
-   lower (e.g. obstacles_25p 0.505 → 0.915) and should not be quoted.
+7. **Training budgets differ by cell in Table 1, and 500k is not a safe budget.** The MLP
+   gets 1M steps on every map (verified across all ten `j2` logs). The GPT gets 1M on
+   `16x16_empty`, `room_v1` and both obstacle maps, and **500k** on `8x8_empty`,
+   `corridors` and `24x24_empty`.
+
+   An earlier version of this caveat argued the three 500k cells had converged — best
+   validation at 425k, ~200k and 230k–295k, followed by decline — so more budget would not
+   change them. **That reasoning is wrong.** A completed 500k run on `room_v1`
+   (`23971720`) plateaued and declined exactly that way and finished at **0.27**, while
+   three 1M runs on the same map reached 0.97, 0.98 and 0.99. Plateau-then-decline at 500k
+   does not predict the 1M outcome.
+
+   Across every completed run in the log set:
+
+   | map | 500k finals | 1M finals |
+   |---|---|---|
+   | `room_v1` @500 | 0.81, 0.27 | 0.99, 0.97, 0.98 |
+   | `obstacles_15p` @500 | 0.84, 0.24 | 0.98 |
+   | `obstacles_25p` @500 | 0.49, 0.28 | 0.93, 0.93 |
+
+   Five of five 1M runs on cluttered maps converged to 0.93–0.99 (spread ≤0.02, *tighter*
+   than the noise floor in caveat 5). No 500k run did. Treat any 500k number as a lower
+   bound, never as a converged result.
+
+   Consequences: the `24x24_empty` row is void (see ⛔ above). The `corridors` and
+   `8x8_empty` rows are mismatched in the GPT's *disfavour* — it wins or ties them anyway,
+   so they stand as conservative, but a 1M re-run would strengthen both.
 
 ---
 
 ## In flight — not a result yet
 
-A candidate fix for `24x24_empty` is running on branch `normalize-test`
-(`--decoder_normalize_z`, see `EVIDENCE.md` §10). It pins `‖z‖` to a learnable constant
-before the decoder projects it, targeting the magnitude deficit in Table 6. Nothing in the
-tables above depends on it, and it must not be reported as a result until its runs land and
-the three regression maps are confirmed unchanged.
+**Decoder-architecture fixes.** Five levers tried; none fixes an open map.
+
+| lever | outcome |
+|---|---|
+| `--decoder_normalize_z` (branch `normalize-test`) | refuted — `room_v1` fell to 0.39 |
+| multi-head decoder | refuted — diverged at 143k on a non-finite gradient, worse on every metric |
+| more training pairs on 24x24 | no effect — 500/700/1,879 all ~0.12 at 1M |
+| longer budget on 24x24 | no effect — 500k and 1M agree |
+| `--decoder_z_all_positions` (branch `z-every-position`) | mixed, see below |
+
+`--decoder_z_all_positions`, all single seed and not yet replicated:
+
+| map | pairs | flag off | flag on | Δ |
+|---|---|---|---|---|
+| `16x16_corridors_v1` | 500 | 0.990 | 0.984 | −0.006 (no regression) |
+| `16x16_room_v1` | 100 | 0.515 | **0.603** | **+0.088** |
+| `16x16_empty` | 100 | 0.520 | 0.544 | +0.024 (inside noise) |
+
+It costs nothing where the method already works and gives ~2σ on a *cluttered* map at low
+data, but does **not** move the open maps, which is where the problem is. Needs a second
+seed before it is a result.
+
+**The pretrained-decoder protocol, never run here.** The paper's own sweep
+(`hypersearch-grid-gps.py`) uses `initialize_decoder_from_pretrained=True` and
+`train_decoder_end_to_end=False`; every run in this repository used neither, for *both*
+arms, because the only checkpoint on disk is the MLP VAE and `DenseVAE` is now a
+Transformer. The comparison is therefore fair but runs GPS with its sample-efficiency
+mechanism switched off — relevant to Table 2 and Table 3, where the GPT needs ~5× the data
+the MLP does. `pretrain_decoder.py` produces the missing checkpoint.
