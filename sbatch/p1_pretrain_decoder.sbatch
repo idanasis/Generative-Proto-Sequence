@@ -58,8 +58,12 @@
 # MLP checkpoint was trained on CPU. Keeping it off the GPU partition means it does not eat
 # one of the 5 GPU slots the QOSMaxGRESPerUser limit allows.
 #
+# TIMING: measured 4.5 s/epoch on a cluster CPU core (~15x slower than a modern laptop), plus
+# ~80 s per eval. The original MLP checkpoint used 20,000 epochs, which would be ~27 h here --
+# over a 1-day wall once evals are counted. 5,000 epochs at eval_every=500 lands near 7 h and
+# is 250x the smoke test. If the FINAL block is still improving, resume with more.
 #SBATCH --partition=main
-#SBATCH --time=6:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --job-name=p1_pretrain
 #SBATCH --output=sbatch/logs/p1_pretrain-%J.out
 #SBATCH --mem=8G
@@ -68,7 +72,7 @@
 module load anaconda
 source activate gps_env
 
-EPOCHS="${1:-20000}"
+EPOCHS="${1:-5000}"
 N_LAYER="${2:-2}"
 N_HEAD="${3:-4}"
 N_EMBD="${4:-32}"
@@ -79,7 +83,7 @@ START=$(date +%s)
 
 poetry run python pretrain_decoder.py \
     --epochs "${EPOCHS}" \
-    --eval_every 200 \
+    --eval_every 500 \
     --decoder_n_layer "${N_LAYER}" \
     --decoder_n_head "${N_HEAD}" \
     --decoder_n_embd "${N_EMBD}" \
