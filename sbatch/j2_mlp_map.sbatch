@@ -39,6 +39,17 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 MAP="$1"
 TRAIN_PAIRS="${2:-500}"
+# 3rd arg: pass 1 for an INDEPENDENT SAMPLE. Default 0 reproduces every historical j2 run.
+#
+# Config defaults are seed=123 and torch_deterministic=True, and this script passes neither,
+# so re-running it unchanged reproduces the same run bit-for-bit -- it is NOT a second seed.
+# j1 hardcodes --no-torch_deterministic, which is why the GPT cells in RESULTS.md show seed
+# spread (room_v1: 0.961/0.929) while the MLP column is n=1 everywhere.
+#
+# That single-seed MLP column is the weakest thing in the comparison: the four cells where
+# the GPT trails do so by 0.006-0.038, and a 1-seed baseline cannot distinguish that from a
+# tie. Pass 1 here to get the replicate.
+NONDETERMINISTIC="${3:-0}"
 WORKTREE="${HOME}/gps-mlp-baseline"
 
 if [ -z "${MAP}" ]; then
@@ -61,8 +72,13 @@ if grep -q "mingpt_decoder" "${WORKTREE}/generative/models/dense_autoencoder/den
     exit 1
 fi
 
+DET_ARGS=()
+if [ "${NONDETERMINISTIC}" != "0" ]; then
+    DET_ARGS=(--no-torch_deterministic)
+fi
+
 cd "${WORKTREE}" || exit 1
-echo "=== J2: map=${MAP}  train_pairs=${TRAIN_PAIRS}  from $(pwd) at $(git rev-parse --short HEAD) ==="
+echo "=== J2: map=${MAP}  train_pairs=${TRAIN_PAIRS}  nondeterministic=${NONDETERMINISTIC}  from $(pwd) at $(git rev-parse --short HEAD) ==="
 
 START=$(date +%s)
 
@@ -75,7 +91,8 @@ poetry run python gps_simplegrid_levels.py \
     --val_dataset_size 100 \
     --test_dataset_size 1000 \
     --train_decoder_end_to_end \
-    --no-initialize_decoder_from_pretrained
+    --no-initialize_decoder_from_pretrained \
+    "${DET_ARGS[@]}"
 
 END=$(date +%s)
 echo "WALL_CLOCK_SECONDS=$((END - START))"
