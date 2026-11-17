@@ -1121,12 +1121,23 @@ Eliminated by measurement: data coverage, budget, decoder capacity (64/256 plans
 `z` — the healthiest of any map), `z` magnitude (§10), episode budget (`max_episode_steps`
 75 and `max_level` 14 on *every* map), plan length (§11.4), and the task itself (MLP 0.973).
 
-Leading hypothesis, **untested**: the 16-D latent (`actor_n_output_channels`, and
-`DenseVAE.decoder_input_size`, both 16) is a fixed-resolution channel being asked to carry
-3.7× more distinct situations than on `16x16_empty`, at measurably the same latent volume
-(`std/norm` 0.1246 vs 0.1306, cosine 0.7746 vs 0.7639). The MLP survives because its plan
-length is 1.26 — its latent resolves 4 outcomes, not 64. Testing it needs
-`decoder_input_size` plumbed through `get_decoder` (~5 lines); it is currently hardcoded.
+**No surviving explanation.** The latent-resolution hypothesis — that the 16-D latent
+(`actor_n_output_channels` and `DenseVAE.decoder_input_size`, both 16) cannot separate 3.7×
+more situations than on `16x16_empty` — rested on the claim that the MLP survives because
+its 1.26-action plans need the latent to resolve 4 outcomes rather than 64. **§11.4 refutes
+that**: at `--sequence_length_weight 0` the GPT also emits ~1-action plans, and 24x24 still
+scored best val 0.19 at 1M. Capacity is out too — 7,200 params gave 0.147 where the same
+shrink was worth +0.32 to +0.43 on 16x16 maps.
+
+What the §8 diagnosis still establishes is narrow and worth keeping: the decoder is healthy
+(64/256 plans from random `z`) and the actor reaches only 23% of its range against a working
+map's 43%. The `z`-magnitude reading of that is **wrong** — the decoder is pre-LN with a
+learned `z_proj`, so a uniform rescale is absorbed, which is why `--decoder_normalize_z`
+did nothing (§10). The 2.7× magnitude gap is a symptom.
+
+Untested: the **1,192-param decoder on 24x24** (job 24279013, running); a **wider latent**
+(`decoder_input_size` is not plumbed through `get_decoder`, ~5 lines); the **pretrained
+frozen decoder**.
 
 A smaller decoder barely helps here: 7,200 params reached best val 0.26 against 0.18. Real
 but nowhere near rescue — consistent with 24x24 having a second, separate problem.

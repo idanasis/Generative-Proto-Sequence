@@ -1,13 +1,18 @@
 # Results — Transformer decoder vs MLP decoder in GPS
 
 Final baseline comparison. Numbers only; reasoning and diagnosis are in
-[`EVIDENCE.md`](EVIDENCE.md) §8, full history in
+[`EVIDENCE.md`](EVIDENCE.md) §8 and **§11 (current state — read first)**, full history in
 [`TRANSFORMER_INTEGRATION.md`](generative/models/dense_autoencoder/TRANSFORMER_INTEGRATION.md) §10.
 
 Task: from-scratch end-to-end RL, `--train_decoder_end_to_end
 --no-initialize_decoder_from_pretrained`. Test set 1,000 start/goal pairs per map.
 GPT = minGPT causal decoder (this work). MLP = the paper's decoder, run unmodified from the
 `6f627a2` code drop.
+
+> **Decoder size is a variable, not a constant, in this document.** Tables 1–6 use the
+> historical **26,688**-parameter GPT decoder. The MLP it is compared against has **2,466**.
+> **Table 2b uses 1,192** and is the current result. Check which size a table uses before
+> quoting it.
 
 ---
 
@@ -45,6 +50,13 @@ eliminated as explanations.
 **Read:** success within 0.04 on all six valid maps; **2–3× fewer decisions per episode on
 every map**; better path optimality on five of six.
 
+> **Partly superseded at 1,192 parameters.** Three of these cells have been re-run with the
+> right-sized decoder (Table 2b, "it costs nothing at 500 pairs"): `obstacles_25p`
+> 0.915 → **0.991**, `16x16_empty` 0.994 → **1.000**, `room_v1` 0.945 → 0.939. The other
+> four maps have **not** been re-run at 500 pairs with 1,192 params, so this table is still
+> the only complete 500-pair sweep — but its GPT column understates what the current decoder
+> does.
+
 `n=2` for `16x16_room_v1` (0.961, 0.929), `16x16_obstacles_v1_25p` (0.924, 0.905) and
 `24x24_empty` (0.120, 0.099); `n=1` elsewhere. MLP is `n=1` throughout.
 
@@ -56,9 +68,9 @@ Both arms 1M steps. The paper's protocol pair count.
 
 > **Superseded by Table 2b.** Every GPT cell here used the historical 26,688-parameter
 > decoder against an MLP with 2,466. At a matched 1,192 parameters the same cells score
-> 0.891 / 0.846 / 0.498 instead of 0.520 / 0.487 / 0.515, and the GPT's mean goes from below
-> the MLP's to **+0.149 above** it. Keep this table only as the record of what an oversized
-> decoder does under data starvation.
+> 0.891 / 0.825 / 0.498 instead of 0.520 / 0.487 / 0.515, and across all five 16x16 maps the
+> GPT's mean goes from **0.505 (below the MLP's 0.644) to 0.783 (+0.139 above it)**. Keep
+> this table only as the record of what an oversized decoder does under data starvation.
 
 | map | cov. | success |  | decoder generations / ep |  |  | agent step ratio |  | revisits (global) |  |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -242,14 +254,20 @@ an absolute count, so the same flag buys very different coverage per map.
 
 **Read:** the decoder is healthy on the failing map — marginally healthier than on the
 working one. The actor has **not** collapsed: its `z` carries the same relative variety
-(`std/norm` matches within 5%), it is simply 2.7× smaller in magnitude. `z` enters the
-Transformer as a prefix token competing against fixed-scale token embeddings in an
-**unnormalised** residual stream, so a small `z` is drowned out. The MLP decoder has no
-residual stream and absorbs a uniform rescale in its weights.
+(`std/norm` matches within 5%), it is simply 2.7× smaller in magnitude.
+
+> **The magnitude explanation that used to sit here is wrong.** It argued that `z` enters an
+> unnormalised residual stream and a small `z` is "drowned out". But the decoder is
+> **pre-LN** (`ln_1`/`ln_2` before each branch, `ln_f` before the head) and `z_proj` is a
+> **learned linear**, so any uniform rescale of `z` is absorbed by training. That is why
+> `--decoder_normalize_z` changed nothing on 24x24 (0.18) while wrecking `room_v1` (0.39).
+> **The 2.7× magnitude difference is a symptom, not a cause.** What the table still
+> establishes is the last row: the actor reaches 23% of the decoder's plan range against a
+> working map's 43%.
 
 ---
 
-## Why `24x24_empty` fails — hypothesis, not yet a result
+## Why `24x24_empty` fails — **unexplained**; every hypothesis so far is refuted
 
 Ruled out by direct measurement: **data coverage** (3.10% vs 3.05% matched, Table 1 ⛔),
 **training budget** (1M changes nothing), **decoder capacity** (64/256 unique plans from
@@ -274,18 +292,35 @@ This predicts the MLP's survival from its *weakness*: its plan length is 1.26 ag
 GPT's 3.00, so its latent must resolve 4 outcomes rather than 64 — ~16× coarser. On this
 reading the replanning advantage (Table 1) and the 24x24 failure are one phenomenon.
 
-**The test.** Run 24x24 at 1M with `--sequence_length_weight 0`, which drives GPT plan
-length to ~1.01 (Table 4). If it then reaches ~0.9, the mechanism is confirmed. If it stays
-near 0.14, this explanation is dead. Table 4's existing 0.141 for that config is **500k**
-and by caveat 7 says nothing. The follow-up fix, if confirmed, is a wider latent
-(`--actor_n_output_channels 64` plus plumbing `decoder_input_size` through `get_decoder`).
+**The test ran, and it refutes the hypothesis above.** 24x24 at 1M with
+`--sequence_length_weight 0` (job 24199247) drives plan length to ~1.01 — the MLP's regime,
+where only 4 outcomes need resolving — and scored **best val 0.19**. The stated criterion
+was "if it stays near 0.14, this explanation is dead." It is dead.
+
+Decoder capacity is also eliminated on this map: 7,200 params gave **0.147** (job 24217602)
+against ~0.12 at 26,688 — movement, but nowhere near rescue, while the same shrink was worth
++0.32 to +0.43 on 16x16 maps.
+
+**So `24x24_empty` currently has no surviving explanation.** Everything proposed has been
+tested and eliminated: coverage, budget, horizon, episode cap, decoder capacity (both
+directions), `z` magnitude, plan length, and the task itself. State it as an open failure,
+not as a diagnosed one.
+
+Untested, in rough order of promise:
+- **the 1,192-parameter decoder on 24x24** — job 24279013, running. The shrink transformed
+  four 16x16 maps and has never been tried here at its best size.
+- **a wider latent.** `actor_n_output_channels` and `DenseVAE.decoder_input_size` are both
+  hardcoded to 16; the latter is not plumbed through `get_decoder` (~5 lines).
+- **the pretrained frozen decoder** (the paper's protocol), never run on any map.
 
 ---
 
 ## Caveats to carry into any write-up
 
-1. **500 pairs is not the paper's protocol** (100). Table 2 gives the 100-pair numbers; no
-   direct comparison to published figures without them.
+1. **500 pairs is not the paper's protocol** (100). **Table 2b** gives the current 100-pair
+   numbers (Table 2 is the superseded oversized-decoder version); no direct comparison to
+   published figures without them. The paper also uses levels 20–30, 1.5M steps and a
+   pretrained frozen decoder, none of which was run here — see "In flight".
 2. **`--train_dataset_size` is not comparable across maps** — see Table 5. Within a map both
    arms get identical data, so per-map comparisons are clean; cross-map ones are not.
 3. **`max_level` is 14 on every map**, so no environment here tests long horizons.
@@ -294,8 +329,14 @@ and by caveat 7 says nothing. The follow-up fix, if confirmed, is a wider latent
    inference-time dropout, and the `torch.floor` bug that disabled
    `--sequence_length_weight`. Deliberate: it is the published method as published. The
    consequence is that the GPT has a working length penalty and the MLP does not.
-5. **Single seed** on most cells and on the MLP throughout. Noise floor is 0.019–0.042 (1σ),
-   so the −0.035/−0.038 gaps in Table 1 are not distinguishable from ties.
+5. **Seeds.** Single seed on most Table 1 cells. The MLP was `n=1` everywhere until
+   2026-11-16, because `j2` passed neither `--seed` nor `--no-torch_deterministic` against
+   defaults `seed=123, torch_deterministic=True` — re-running it reproduced the same run
+   bit-for-bit. Fixed: `j2 <map> [pairs] [1]`. Replicated MLP cells so far:
+   `16x16_empty` @100 **0.930 / 0.836** (spread **0.094**), `room_v1` @500 0.980 / 0.973,
+   `obstacles_15p` @500 0.987 / 0.972. **The noise floor is far looser at 100 pairs than at
+   500** — use 0.094 there, 0.015 at 500 pairs. The −0.035/−0.038 gaps in Table 1 are
+   against a baseline that replicates to ±0.015, so they are small but probably real.
 6. **Deterministic inference** costs ~0.10 normally but 0.33–0.39 at 100 pairs, where the
    policy leans on sampling noise. Report which pass you are quoting.
 7. **Training budgets differ by cell in Table 1, and 500k is not a safe budget.** The MLP
@@ -340,17 +381,18 @@ and by caveat 7 says nothing. The follow-up fix, if confirmed, is a wider latent
 | longer budget on 24x24 | no effect — 500k and 1M agree |
 | `--decoder_z_all_positions` (branch `z-every-position`) | mixed, see below |
 
-`--decoder_z_all_positions`, all single seed and not yet replicated:
+`--decoder_z_all_positions`, all at the historical 26,688-parameter decoder:
 
 | map | pairs | flag off | flag on | Δ |
 |---|---|---|---|---|
 | `16x16_corridors_v1` | 500 | 0.990 | 0.984 | −0.006 (no regression) |
-| `16x16_room_v1` | 100 | 0.515 | **0.603** | **+0.088** |
+| `16x16_room_v1` | 100 | 0.515 | **0.603 / 0.566** (n=2) | **+0.070** |
 | `16x16_empty` | 100 | 0.520 | 0.544 | +0.024 (inside noise) |
 
-It costs nothing where the method already works and gives ~2σ on a *cluttered* map at low
-data, but does **not** move the open maps, which is where the problem is. Needs a second
-seed before it is a result.
+Replicated on `room_v1`, the only replicated positive from any architecture lever. But it
+costs nothing where the method already works and does **not** move the open maps, and it was
+measured on the oversized decoder — a +0.070 on a cell that the 1,192-param decoder leaves
+at 0.498 is not obviously worth carrying. **Untested at 1,192 params.**
 
 **The pretrained-decoder protocol, never run here.** The paper's own sweep
 (`hypersearch-grid-gps.py`) uses `initialize_decoder_from_pretrained=True` and
