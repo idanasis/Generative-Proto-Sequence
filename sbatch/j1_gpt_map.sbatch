@@ -102,6 +102,28 @@ DECODER_N_LAYER="${6:-2}"
 DECODER_N_HEAD="${7:-4}"
 DECODER_N_EMBD="${8:-32}"
 
+# 9th arg: path to a decoder checkpoint from pretrain_decoder.py. Empty (the default) keeps
+# the from-scratch end-to-end path every run before 2026-11-16 used.
+#
+# This is THE PAPER'S PROTOCOL and it has never been run in this repo. hypersearch-grid-gps.py
+# uses initialize_decoder_from_pretrained=True and train_decoder_end_to_end=False -- a
+# pretrained, frozen decoder -- while every run here used neither, for BOTH arms, because the
+# only checkpoint on disk was the MLP VAE and DenseVAE is now a Transformer. The comparison
+# was fair but ran GPS with its sample-efficiency mechanism switched off.
+#
+# The decoder SHAPE must match the checkpoint or load_state_dict rejects it. Pretrain the
+# matching shape first:
+#   sbatch sbatch/p1_pretrain_decoder.sbatch 5000 1 2 8
+#   sbatch sbatch/j1_gpt_map.sbatch 16x16_empty 0.002 100 1000000 0 1 2 8 \
+#       generative/models/dense_autoencoder/gptVAE_l1_h2_e8_in10_lat16_var1_ep5000_seed42.pt
+#
+# 10th arg: 1 (default) freezes the decoder -- the paper's setting. 0 fine-tunes it from the
+# pretrained init, which is a different experiment: it tests whether pretraining helps as an
+# initialisation, separately from whether freezing prevents the actor/decoder co-adaptation
+# that pins plan length to a constant (EVIDENCE.md §11.3).
+DECODER_CKPT="${9:-}"
+DECODER_FREEZE="${10:-1}"
+
 if [ -z "${MAP}" ]; then
     echo "ERROR: pass the obstacle map, e.g."
     echo "  sbatch $0 16x16_obstacles_v1_25p"
@@ -117,13 +139,28 @@ if [ "${Z_ALL_POSITIONS}" != "0" ]; then
     ZPOS_ARGS=(--decoder_z_all_positions)
 fi
 
+# Default: from scratch, end-to-end. With a checkpoint: pretrained init, frozen or not.
+PRETRAIN_ARGS=(--train_decoder_end_to_end --no-initialize_decoder_from_pretrained)
+if [ -n "${DECODER_CKPT}" ]; then
+    if [ ! -f "${DECODER_CKPT}" ]; then
+        echo "ERROR: decoder checkpoint not found: ${DECODER_CKPT}"
+        exit 1
+    fi
+    if [ "${DECODER_FREEZE}" != "0" ]; then
+        PRETRAIN_ARGS=(--initialize_decoder_from_pretrained --no-train_decoder_end_to_end)
+    else
+        PRETRAIN_ARGS=(--initialize_decoder_from_pretrained --train_decoder_end_to_end)
+    fi
+    PRETRAIN_ARGS+=(--decoder_model_path "${DECODER_CKPT}")
+fi
+
 LENGTH_ARGS=()
 if [ "${LENGTH_WEIGHT}" != "0" ]; then
     LENGTH_ARGS=(--sequence_length_weight "${LENGTH_WEIGHT}"
                  --min_lengths_per_head 4 --max_lengths_per_head 10)
 fi
 
-echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS}  z_all_positions=${Z_ALL_POSITIONS}  decoder=${DECODER_N_LAYER}L/${DECODER_N_HEAD}H/${DECODER_N_EMBD}E ==="
+echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS}  z_all_positions=${Z_ALL_POSITIONS}  decoder=${DECODER_N_LAYER}L/${DECODER_N_HEAD}H/${DECODER_N_EMBD}E  pretrained=${DECODER_CKPT:-none}  freeze=${DECODER_FREEZE} ==="
 
 START=$(date +%s)
 
@@ -136,8 +173,7 @@ poetry run python gps_simplegrid_levels.py \
     --train_eval_dataset_size 100 \
     --val_dataset_size 100 \
     --test_dataset_size 1000 \
-    --train_decoder_end_to_end \
-    --no-initialize_decoder_from_pretrained \
+    "${PRETRAIN_ARGS[@]}" \
     --decoder_use_cuda_graph \
     --eval_test_dataset_during_training_freq -1 \
     --total_timesteps "${TOTAL_STEPS}" \

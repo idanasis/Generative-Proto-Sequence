@@ -12,6 +12,22 @@ with success rate will produce a misleading document.
 **§10 is a refuted fix** for the one failing environment. Read it before proposing anything
 that normalises or rescales the actor's latent `z`.
 
+> ### ⚠ §11 SUPERSEDES MUCH OF THIS FILE (2026-11-16)
+>
+> Three findings land after everything in §1–§10 was written, and two of them reverse
+> explicit advice given below:
+>
+> 1. **Decoder size was the dominant lever at 100 pairs, downward.** 26,688 → 1,192
+>    parameters took `16x16_empty` @100 from 0.530 to **0.893**, against an MLP that
+>    replicates to **0.883**. §6's "do not re-open capacity" only ever considered *larger*
+>    decoders (F1/F2). It was wrong about the direction.
+> 2. **Reconstruction pretraining is done.** §6 calls it "blocked on ~a day's work". It took
+>    8 minutes and it works — 194/256 unique plans and **11 distinct plan lengths**.
+> 3. **The plan-length hypothesis is refuted at 1M on both open maps**, and the MLP's
+>    single-seed numbers in §8 are not safe: its spread at 100 pairs is **0.094**.
+>
+> Read **§11** before trusting any number in §1, §8 or §9.
+
 Branch: `transformer-integration` (PR #2 against `liadgiladi:main`, draft).
 Task: from-scratch end-to-end RL (`--train_decoder_end_to_end
 --no-initialize_decoder_from_pretrained`) across all 7 maps the repo ships — §8.
@@ -414,11 +430,13 @@ test evaluations are logging only.
   encode sub-sequences with the VAE **encoder**, which gets no gradient in from-scratch E2E
   runs, so the stored `z` would be noise. Also a design risk: with `z` in the critic's
   input, the actor can raise Q by moving `z` without the decoded sequence improving.
-- **Reconstruction pretraining** — **the only substantial lever left.** The decoder has
-  never been shown an action sequence; it has been asked to learn sequence structure from
-  sparse RL reward alone, which is the hardest possible way to train a sequence model and
-  discards the Transformer's actual advantage. Would also train the encoder the item above
-  needs. Blocked on the §4.1–4.3 standalone-loop fixes (~a day's work).
+- **Reconstruction pretraining** — ~~the only substantial lever left~~ **DONE, see §11.3.**
+  It was never blocked on a day's work: `pretrain_decoder.py` + `sbatch/p1_pretrain_decoder.sbatch`
+  run it in **8 minutes on CPU**. Result: train exact 1.000 / val exact 0.750, **194/256**
+  unique plans from random `z` (against the end-to-end decoder's 64/256) and **11 distinct
+  plan lengths** (against a hard constant of 3.000). The stale `__main__` block in
+  `dense_var_auto_encoder_vin_1.py` had rotted against the Transformer refactor, which is
+  probably why this looked expensive.
 - **More knob-turning on length / soft feedback** — finished, and D7/D8 are the proof.
   Stacking soft feedback on the best config gained +0.009; doubling the length weight
   gained +0.017. Both inside the 0.042 noise floor. Do not re-sweep these.
@@ -428,6 +446,21 @@ test evaluations are logging only.
   traded capacity for a speedup that does not exist.)*
 
 ### Next, in order
+
+> **This list is superseded — see §11.** "The baseline comparison is closed" was wrong in
+> both directions: the 100-pair deficit was a decoder-size artifact (§11.1), and the
+> 500-pair "near-parity" cells rest on an MLP column that was `n=1` because `j2` never
+> varied its seed (§11.5). The current order is:
+>
+> 1. **Land the 1,192-param follow-ups** (24241292–95): second seed at 100 pairs, the
+>    500-pair regression check, and transfer to `room_v1` / `obstacles_25p`. If they hold,
+>    rebuild §8's tables with a right-sized decoder — most of this file's accuracy story is
+>    measured on a 10.8×-oversized one.
+> 2. **Run the paper protocol**, both arms pretrained and frozen (§11.3). Never done.
+> 3. **`24x24_empty`: plumb `decoder_input_size`** and test a wider latent (§11.2). The only
+>    hypothesis still standing.
+> 4. **Then the thesis** — state-dependent plan length. §11.3 shows a pretrained decoder
+>    already emits 11 distinct lengths, so the mechanism is available rather than absent.
 
 **The baseline comparison is closed** (§8): near-parity on six maps at matched budgets, one
 failure, and the length penalty confirmed load-bearing rather than harmful.
@@ -455,8 +488,15 @@ failure, and the length penalty confirmed load-bearing rather than harmful.
 4. **Reconstruction pretraining** — unchanged in priority; addresses sequence *quality*, not
    the length rigidity.
 
-**Do not** re-open capacity, multi-head-for-accuracy, or soft-feedback tuning: all were
+**Do not** re-open ~~capacity~~, multi-head-for-accuracy, or soft-feedback tuning: all were
 aimed at the corridors-only 0.069 gap, which §1.1 shows was data starvation.
+
+> **The capacity exclusion was wrong, and expensively so — see §11.1.** F1/F2 tested
+> `n_layer 3, n_embd 64` (152,512 params) and both NaN'd, so this line generalised "bigger
+> does not help" into "capacity is closed". **Nobody ever tried smaller.** The decoder being
+> replaced has **2,466** parameters; ours had **26,688**, 10.8× larger. Shrinking it to
+> 1,192 is worth **+0.363** on `16x16_empty` @100. Multi-head and soft-feedback remain
+> closed.
 
 ---
 
@@ -557,6 +597,18 @@ seed peaked at 295k and then declined, so a longer budget will not help. Ruled o
 - **not horizon** — `max_level 14` caps every map at 14-step paths
 - **not the length penalty** — the `weight 0` arm scores 0.141, equally bad
 
+> **Budget and data are now ruled out properly, and the numbers above are 500k — see §11.2.**
+> Every GPT run on this map had been 500k while the MLP got 1M. At **1M**: 700 pairs →
+> 0.115, 1,879 pairs → 0.128. The 1,879-pair run is **coverage-matched** to the
+> `16x16_empty` cell that scores 0.994 (3.10% vs 3.05%), so data is eliminated, not merely
+> argued away. The penalty-off arm also re-ran at 1M: **best val 0.19**, confirming "not the
+> length penalty" at a budget that means something.
+>
+> The claim "a longer budget will not help" was correct here but was argued from
+> plateau-then-decline at 500k, which is **not** valid reasoning — a completed 500k run on
+> `room_v1` plateaued the same way at 0.27 while three 1M runs reached 0.97–0.99. Right
+> answer, wrong method.
+
 Something specific to the Transformer breaks on the 484-free-cell map while the MLP is
 unaffected — it is the only cell where the two decoders are genuinely far apart.
 
@@ -649,6 +701,12 @@ The same four maps at the paper's 100-pair protocol, both arms at 1M steps:
 | 16x16_obstacles_v1_15p | 0.9% | 0.497 | **0.636** | −0.139 |
 | 16x16_room_v1 | 1.2% | 0.515 | 0.507 | +0.008 |
 | 16x16_obstacles_v1_25p | 1.3% | **0.487** | 0.399 | **+0.088** |
+
+> **Both columns of the first row are superseded — see §11.1.** The GPT's 0.520 was a
+> **26,688-parameter** decoder; at 1,192 parameters the same cell scores **0.893**. The
+> MLP's 0.930 is one seed; a second gave **0.836**, so the target is **0.883 ± 0.047**.
+> Matched on decoder size, the GPT is at or above the MLP here. The −0.410 that the rest of
+> this section is built on was a capacity artifact, not a property of the architecture.
 
 **2–2, and the GPT wins on the hardest map while losing badly on the easiest.** But the
 scores are not the finding — the *variances* are:
@@ -955,3 +1013,173 @@ addresses, and it is now the leading one.
 > **Preliminary:** the table above is validation at 241k–460k steps, read while the four runs
 > were still going (jobs 24060410–13). The direction is unambiguous but the final test
 > numbers are not in yet. Update this section when they land.
+
+---
+
+## 11. Current state (2026-11-16) — read this before §1, §8 or §9
+
+Three findings, two of which reverse advice given above.
+
+### 11.1 Decoder size was the dominant lever — **downward**
+
+`16x16_empty` @100 pairs, 1M steps, decoder shape the only variable:
+
+| n_layer / n_head / n_embd | params | vs MLP (2,466) | test success |
+|---|---|---|---|
+| **1 / 2 / 8** | **1,192** | **0.5×** | **0.893** |
+| 1 / 4 / 16 | 3,920 | 1.6× | 0.647 |
+| 2 / 4 / 16 | 7,200 | 2.9× | 0.670 |
+| 1 / 4 / 32 | 13,984 | 5.7× | 0.552 |
+| 2 / 4 / 32 (historical default) | 26,688 | 10.8× | 0.520 / 0.540 |
+
+Monotone in size. The baseline is replicated (0.520, 0.540) so the trend is not a seed
+artifact. **+0.363 from deleting parameters.**
+
+And the MLP target was never 0.930 — that was one seed. A second gave **0.836**:
+
+| 16x16_empty @100 | success |
+|---|---|
+| GPT, 1,192 params | **0.893** (n=1) |
+| MLP, 2,466 params | **0.883** (0.930 / 0.836) |
+
+**At matched decoder size the Transformer is at or above the MLP in the paper's data
+regime.** Replicated: **0.893 / 0.889**, a spread of 0.004.
+
+#### The full 100-pair picture at 1,192 params (2026-11-17)
+
+All 1M steps, `--train_dataset_size 100`, the paper's protocol. MLP figures from `j2`.
+
+| map | GPT succ | MLP succ | GPT gen/ep | MLP gen/ep | reduction | GPT ratio | MLP ratio | GPT plan len |
+|---|---|---|---|---|---|---|---|---|
+| 16x16_empty | **0.891** *(.893/.889)* | 0.883 *(.930/.836)* | **5.67** | 8.47 | **1.5×** | **0.780** | 0.762 | 3.05 |
+| 16x16_obstacles_v1_25p | **0.846** | 0.399 | **4.72** | 23.04 | **4.9×** | **0.788** | 0.366 | 3.00 |
+| 16x16_room_v1 | 0.498 | 0.507 | **8.88** | 24.21 | **2.7×** | **0.553** | 0.452 | 3.03 |
+| mean | **0.745** | 0.596 | | | | | | |
+
+**The Transformer now wins the paper's data regime outright** — +0.149 mean success, fewer
+decoder generations on every map (1.5–4.9×), and a better agent step ratio on every map.
+Plan length stays at ~3.0 throughout, so none of this comes from degenerating into a
+per-step policy. Contrast §8's 100-pair section, which recorded the GPT as flat at ~0.50
+across all four maps and "insensitive to map difficulty" — that was the oversized decoder.
+
+Two qualifications. `obstacles_25p`'s +0.359 is **n=1** (seed 2 running, job 24256431), and
+`obstacles_15p` / `corridors` at 100 pairs have **not** been run at 1,192 params — the MLP
+leads the first of those 0.636 vs 0.497 at 26,688, so the sweep is three maps, not five.
+
+`unused actions/seq` is the one consistent cost: 0.46–0.73 against the MLP's 0.17, i.e.
+~20% of emitted actions discarded against ~9%. State it; it is the price of committing to 3
+actions.
+
+#### At 500 pairs the shrink costs nothing
+
+| 16x16_empty @500 | success | gen/ep | step ratio | plan len |
+|---|---|---|---|---|
+| GPT 1,192 | **1.000** | **3.07** | **0.993** | 3.00 |
+| GPT 7,200 | 0.974 | — | — | — |
+| GPT 26,688 | 0.994 | 3.42 | 0.946 | 3.00 |
+| MLP 2,466 | 1.000 | 5.73 | 0.889 | 1.80 |
+
+A 0.993 step ratio is near-optimal pathing. The smaller decoder is better than the larger
+one at **both** data regimes, so this is not a starved-regime-only fix. Regression checks on
+`room_v1` and `obstacles_25p` at 500 pairs are jobs 24256432/33.
+
+#### Convergence
+
+GPT best-validation step is **215k–455k**; the MLP's is **965k and still climbing at the
+budget wall**, so its 100-pair numbers are lower bounds. §4 read the Transformer's early
+plateau as a capacity ceiling. With a right-sized decoder the same early stop lands at a
+*better* score in ~4× fewer steps — it was overfitting, not saturating.
+
+Why it was missed: §4 and §6 treated capacity as a *ceiling* and tested only upward (F1/F2,
+152,512 params, both NaN'd). The hypothesis that 26,688 parameters **overfit 100 training
+pairs** was never posed. Rule 6 ("check the data regime before blaming the model") had the
+right instinct and was applied in only one direction.
+
+**Not yet known, all in flight:** whether 1,192 holds at 500 pairs (24241293 — the 7,200
+version gave 0.974 against 0.994, inside noise), and whether it transfers to cluttered maps
+(24241294 room, 24241295 obstacles_25p). Do not adopt it as the default until those land.
+
+### 11.2 `24x24_empty` — failure confirmed at matched budget *and* matched coverage
+
+| map | pairs | train pool | coverage | budget | success |
+|---|---|---|---|---|---|
+| 16x16_empty | 500 | 16,380 | 3.05% | 1M | **0.994** |
+| 24x24_empty | 1,879 | 60,620 | 3.10% | 1M | **0.128** |
+
+Also 700 pairs @1M → 0.115, and penalty-off @1M → best val 0.19. Every GPT run on this map
+before 2026-11-15 was 500k against the MLP's 1M, so §8's 0.110 was budget-mismatched; the
+failure survives the correction.
+
+Eliminated by measurement: data coverage, budget, decoder capacity (64/256 plans from random
+`z` — the healthiest of any map), `z` magnitude (§10), episode budget (`max_episode_steps`
+75 and `max_level` 14 on *every* map), plan length (§11.4), and the task itself (MLP 0.973).
+
+Leading hypothesis, **untested**: the 16-D latent (`actor_n_output_channels`, and
+`DenseVAE.decoder_input_size`, both 16) is a fixed-resolution channel being asked to carry
+3.7× more distinct situations than on `16x16_empty`, at measurably the same latent volume
+(`std/norm` 0.1246 vs 0.1306, cosine 0.7746 vs 0.7639). The MLP survives because its plan
+length is 1.26 — its latent resolves 4 outcomes, not 64. Testing it needs
+`decoder_input_size` plumbed through `get_decoder` (~5 lines); it is currently hardcoded.
+
+A smaller decoder barely helps here: 7,200 params reached best val 0.26 against 0.18. Real
+but nowhere near rescue — consistent with 24x24 having a second, separate problem.
+
+### 11.3 Pretraining works, and it breaks the length constant
+
+`pretrain_decoder.py`, 5,000 epochs, **8 minutes on CPU**, no GPU slot:
+
+```
+train exact 1.000   val exact 0.750   action-only acc 0.967
+unique plans from random z: 194/256      (end-to-end RL decoder: 64/256)
+plan length: 6.68 +/- 2.70, 11 distinct   (end-to-end: exactly 3.000, always)
+```
+
+**Eleven distinct plan lengths.** Four architecture levers (multi-head, `normalize_z`,
+`z_all_positions`, length-weight tuning) failed to make plan length vary at all. A decoder
+fitted to the length-1–10 corpus does it for free. **So the rigidity in §8 is caused by
+end-to-end RL training, not by the Transformer.** That is direct support for the
+adaptive-replanning thesis.
+
+Posterior collapse is real but transient — diversity falls to 7/256 by epoch 20 and recovers
+past 190/256 by epoch 1,000. Do not judge a pretraining run before ~1,500 epochs.
+
+The checkpoint enables a **second, symmetric comparison** nobody has run: both arms with
+`--initialize_decoder_from_pretrained --no-train_decoder_end_to_end`, the paper's actual
+protocol. The MLP's checkpoint has shipped since `6f627a2`; only the GPT was missing one.
+
+### 11.4 Refuted this week
+
+- **Plan length is not why the MLP wins on open maps.** `16x16_empty` @100 with
+  `--sequence_length_weight 0`: **0.246** against 0.520 with it. 24x24 @1M penalty-off: best
+  val 0.19. The penalty is load-bearing on open maps too, and the MLP's ~1-action plans are
+  not the source of its advantage. Predicted 0.7–0.9; got 0.246.
+- **`--decoder_z_all_positions`** (branch `z-every-position`): corridors @500 0.984 vs 0.990
+  (no regression), `room_v1` @100 **0.603 / 0.566** vs 0.515 (+0.070, n=2 — the only
+  replicated positive), `16x16_empty` @100 0.544 vs 0.520 (inside noise). It does not move
+  open maps, which is where the problem is.
+
+### 11.5 Corrections to §2's rules
+
+- **Rule 1's noise floor is map- and regime-dependent, and 100 pairs is far looser than
+  0.042.** The MLP at `16x16_empty` @100 spans **0.930 / 0.836** — a 0.094 spread. At 500
+  pairs the same decoder replicates to ±0.015 (`room_v1` 0.980/0.973, `obstacles_15p`
+  0.987/0.972). **Two seeds per arm are mandatory at 100 pairs; one may do at 500.**
+- **Rule 5 needs a corollary.** "Plateaued then declined at 500k" does **not** license
+  skipping a 1M run: `room_v1` job 23971720 ran to completion at 500k, plateaued, and
+  finished at **0.27**, while three 1M runs on the same config reached 0.97–0.99. Across the
+  log set every completed 1M run on a cluttered map landed in 0.93–0.99 (5/5, spread ≤0.02)
+  and **no** 500k run did. Treat any 500k number as a floor.
+- **`j2` did not vary its seed.** It passes neither `--seed` nor `--no-torch_deterministic`
+  against defaults `seed=123, torch_deterministic=True`, so re-running it reproduced the same
+  run bit-for-bit — which is why the MLP column was n=1 everywhere while `j1` (which
+  hardcodes `--no-torch_deterministic`) showed seed spread. **Fixed:** `j2 <map> [pairs] [1]`,
+  third argument 1 for an independent sample.
+
+### 11.6 Tooling added
+
+| script | answers |
+|---|---|
+| `pretrain_decoder.py` | offline VAE pretraining; reports reconstruction, plan diversity and the **plan-length distribution** |
+| `sbatch/p1_pretrain_decoder.sbatch` | the above as a CPU job — no GPU slot. Note the name collides with `p1_full_1m.sbatch` |
+| `j1 <map> [weight] [pairs] [steps] [z_all] [n_layer] [n_head] [n_embd]` | args 6–8 are new; defaults 2/4/32 reproduce every prior run |
+| `j2 <map> [pairs] [nondeterministic]` | arg 3 is new; **1 is required for a real second seed** |

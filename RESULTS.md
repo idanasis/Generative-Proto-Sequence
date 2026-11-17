@@ -54,6 +54,12 @@ every map**; better path optimality on five of six.
 
 Both arms 1M steps. The paper's protocol pair count.
 
+> **Superseded by Table 2b.** Every GPT cell here used the historical 26,688-parameter
+> decoder against an MLP with 2,466. At a matched 1,192 parameters the same cells score
+> 0.891 / 0.846 / 0.498 instead of 0.520 / 0.487 / 0.515, and the GPT's mean goes from below
+> the MLP's to **+0.149 above** it. Keep this table only as the record of what an oversized
+> decoder does under data starvation.
+
 | map | cov. | success |  | decoder generations / ep |  |  | agent step ratio |  | revisits (global) |  |
 |---|---|---|---|---|---|---|---|---|---|---|
 | | | **GPT** | MLP | **GPT** | MLP | **red.** | **GPT** | MLP | **GPT** | MLP |
@@ -85,6 +91,67 @@ wall, so its 0.930 is a lower bound.
 
 "Coverage" is the share of each map's level-1–14 train pool that the pair count buys; it
 differs per map because the maps differ in free space. See Table 5.
+
+---
+
+## Table 2b — 100 pairs with a right-sized decoder (2026-11-17)
+
+Table 2 above used the historical **26,688**-parameter decoder. The MLP it is compared
+against has **2,466**. Matching the scale changes the result.
+
+GPT at `--decoder_n_layer 1 --decoder_n_head 2 --decoder_n_embd 8` (**1,192** params, 0.5×
+the MLP). Both arms 1M steps, 100 training pairs.
+
+| map | success |  | decoder generations / ep |  |  | agent step ratio |  | plan length |  |
+|---|---|---|---|---|---|---|---|---|---|
+| | **GPT** | MLP | **GPT** | MLP | **reduction** | **GPT** | MLP | **GPT** | MLP |
+| 16x16_empty | **0.891** | 0.883 | **5.67** | 8.47 | **1.5×** | **0.780** | 0.762 | 3.05 | 1.78 |
+| 16x16_obstacles_v1_25p | **0.846** | 0.399 | **4.72** | 23.04 | **4.9×** | **0.788** | 0.366 | 3.00 | 1.12 |
+| 16x16_room_v1 | 0.498 | 0.507 | **8.88** | 24.21 | **2.7×** | **0.553** | 0.452 | 3.03 | 1.13 |
+| **mean** | **0.745** | 0.596 | | | | | | | |
+
+**Read:** at the paper's pair count the Transformer wins on **mean success (+0.149)**,
+**decoder generations on every map (1.5–4.9× fewer)** and **path optimality on every map**,
+while emitting ~3-action plans against the MLP's ~1.1–1.8. Compare Table 2, where the same
+architecture at 26,688 parameters scored 0.49–0.52 on all four maps.
+
+Seeds: `16x16_empty` **n=2 (0.893 / 0.889)**; the other two cells are **n=1**.
+`obstacles_15p` and `corridors` have not been run at this size — at 26,688 the MLP led
+`obstacles_15p` 0.636 vs 0.497, so this is three maps, not five.
+
+The decoder-size sweep that produced it, on `16x16_empty` @100:
+
+| n_layer / n_head / n_embd | params | vs MLP | success |
+|---|---|---|---|
+| **1 / 2 / 8** | **1,192** | **0.5×** | **0.893 / 0.889** |
+| 1 / 4 / 16 | 3,920 | 1.6× | 0.647 |
+| 2 / 4 / 16 | 7,200 | 2.9× | 0.670 |
+| 1 / 4 / 32 | 13,984 | 5.7× | 0.552 |
+| 2 / 4 / 32 (historical) | 26,688 | 10.8× | 0.520 / 0.540 |
+
+Monotone in size, with a replicated baseline. **+0.363 from deleting parameters.**
+
+### And it costs nothing at 500 pairs
+
+| 16x16_empty @500 | success | gen/ep | step ratio |
+|---|---|---|---|
+| GPT 1,192 | **1.000** | **3.07** | **0.993** |
+| GPT 7,200 | 0.974 | — | — |
+| GPT 26,688 | 0.994 | 3.42 | 0.946 |
+| MLP 2,466 | 1.000 | 5.73 | 0.889 |
+
+Regression checks on `room_v1` and `obstacles_25p` at 500 pairs are in flight.
+
+### Two caveats that belong beside these numbers
+
+**The MLP had not converged.** Its best validation lands at step 965,000, still climbing at
+the 1M wall, on every 100-pair cell. Its numbers here are lower bounds. The GPT peaks at
+215k–455k, so it reaches a better score in ~4× fewer steps — but a longer MLP budget could
+narrow the success column.
+
+**The GPT wastes more actions.** `unused actions/seq` 0.46–0.73 against the MLP's 0.17 —
+~20% of emitted actions discarded against ~9%. That is the cost of a 3-action commitment and
+the one axis where the MLP is consistently better.
 
 ---
 
