@@ -1051,10 +1051,12 @@ All 1M steps, `--train_dataset_size 100`, the paper's protocol. MLP figures from
 
 | map | GPT succ | MLP succ | GPT gen/ep | MLP gen/ep | reduction | GPT ratio | MLP ratio | GPT plan len |
 |---|---|---|---|---|---|---|---|---|
+| 16x16_obstacles_v1_15p | **0.957** | 0.636 | **5.73** | 19.16 | **3.3×** | **0.672** | 0.561 | 3.04 |
 | 16x16_empty | **0.891** *(.893/.889)* | 0.883 *(.930/.836)* | **5.67** | 8.47 | **1.5×** | **0.780** | 0.762 | 3.05 |
-| 16x16_obstacles_v1_25p | **0.846** | 0.399 | **4.72** | 23.04 | **4.9×** | **0.788** | 0.366 | 3.00 |
+| 16x16_obstacles_v1_25p | **0.825** *(.846/.803)* | 0.399 | **4.89** | 23.04 | **4.7×** | **0.773** | 0.366 | 3.00 |
+| 16x16_corridors_v1 | 0.744 | **0.794** | **5.24** | 13.34 | **2.5×** | 0.723 | — | 3.02 |
 | 16x16_room_v1 | 0.498 | 0.507 | **8.88** | 24.21 | **2.7×** | **0.553** | 0.452 | 3.03 |
-| mean | **0.745** | 0.596 | | | | | | |
+| mean | **0.783** | 0.644 | | | | | | |
 
 **The Transformer now wins the paper's data regime outright** — +0.149 mean success, fewer
 decoder generations on every map (1.5–4.9×), and a better agent step ratio on every map.
@@ -1062,9 +1064,12 @@ Plan length stays at ~3.0 throughout, so none of this comes from degenerating in
 per-step policy. Contrast §8's 100-pair section, which recorded the GPT as flat at ~0.50
 across all four maps and "insensitive to map difficulty" — that was the oversized decoder.
 
-Two qualifications. `obstacles_25p`'s +0.359 is **n=1** (seed 2 running, job 24256431), and
-`obstacles_15p` / `corridors` at 100 pairs have **not** been run at 1,192 params — the MLP
-leads the first of those 0.636 vs 0.497 at 26,688, so the sweep is three maps, not five.
+Two cells carry it: **`obstacles_15p` +0.321** and **`obstacles_25p` +0.426**, the two maps
+the MLP handles worst. The GPT trails on `corridors` (−0.050) and ties on `room_v1` and
+`16x16_empty`. Seeds: `16x16_empty` and `obstacles_25p` are n=2; the rest n=1.
+
+**`room_v1` is the one map the shrink does not help** (0.515 → 0.498), and coverage does not
+explain it — 1.2% against `obstacles_25p`'s 1.3%. Unexplained; do not paper over it.
 
 `unused actions/seq` is the one consistent cost: 0.46–0.73 against the MLP's 0.17, i.e.
 ~20% of emitted actions discarded against ~9%. State it; it is the price of committing to 3
@@ -1072,16 +1077,18 @@ actions.
 
 #### At 500 pairs the shrink costs nothing
 
-| 16x16_empty @500 | success | gen/ep | step ratio | plan len |
-|---|---|---|---|---|
-| GPT 1,192 | **1.000** | **3.07** | **0.993** | 3.00 |
-| GPT 7,200 | 0.974 | — | — | — |
-| GPT 26,688 | 0.994 | 3.42 | 0.946 | 3.00 |
-| MLP 2,466 | 1.000 | 5.73 | 0.889 | 1.80 |
+| map @500 | GPT 1,192 | GPT 26,688 | MLP | shrink Δ | GPT gen/ep | GPT ratio |
+|---|---|---|---|---|---|---|
+| 16x16_obstacles_v1_25p | **0.991** | 0.915 | 0.953 | **+0.076** | 3.74 | 0.882 |
+| 16x16_empty | **1.000** | 0.994 | 1.000 | +0.006 | 3.07 | **0.993** |
+| 16x16_room_v1 | 0.939 | 0.945 | 0.980 | −0.006 | 4.71 | 0.801 |
 
-A 0.993 step ratio is near-optimal pathing. The smaller decoder is better than the larger
-one at **both** data regimes, so this is not a starved-regime-only fix. Regression checks on
-`room_v1` and `obstacles_25p` at 500 pairs are jobs 24256432/33.
+**No regression anywhere.** The smaller decoder is better at **both** data regimes, so this
+is not a starved-regime-only fix — it is the default to adopt. A 0.993 step ratio on
+`16x16_empty` is near-optimal pathing (26,688 gave 0.946, the MLP 0.889).
+
+`room_v1` and `obstacles_25p` peaked at **980k and 955k**, still climbing at the 1M wall, so
+both are lower bounds.
 
 #### Convergence
 

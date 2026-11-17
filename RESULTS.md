@@ -105,19 +105,27 @@ the MLP). Both arms 1M steps, 100 training pairs.
 | map | success |  | decoder generations / ep |  |  | agent step ratio |  | plan length |  |
 |---|---|---|---|---|---|---|---|---|---|
 | | **GPT** | MLP | **GPT** | MLP | **reduction** | **GPT** | MLP | **GPT** | MLP |
+| 16x16_obstacles_v1_15p | **0.957** | 0.636 | **5.73** | 19.16 | **3.3×** | **0.672** | 0.561 | 3.04 | 1.22 |
 | 16x16_empty | **0.891** | 0.883 | **5.67** | 8.47 | **1.5×** | **0.780** | 0.762 | 3.05 | 1.78 |
-| 16x16_obstacles_v1_25p | **0.846** | 0.399 | **4.72** | 23.04 | **4.9×** | **0.788** | 0.366 | 3.00 | 1.12 |
+| 16x16_obstacles_v1_25p | **0.825** | 0.399 | **4.89** | 23.04 | **4.7×** | **0.773** | 0.366 | 3.00 | 1.85 |
+| 16x16_corridors_v1 | 0.744 | **0.794** | **5.24** | 13.34 | **2.5×** | 0.723 | — | 3.02 | 2.06 |
 | 16x16_room_v1 | 0.498 | 0.507 | **8.88** | 24.21 | **2.7×** | **0.553** | 0.452 | 3.03 | 1.13 |
-| **mean** | **0.745** | 0.596 | | | | | | | |
+| **mean** | **0.783** | 0.644 | | | | | | | |
 
-**Read:** at the paper's pair count the Transformer wins on **mean success (+0.149)**,
-**decoder generations on every map (1.5–4.9× fewer)** and **path optimality on every map**,
-while emitting ~3-action plans against the MLP's ~1.1–1.8. Compare Table 2, where the same
-architecture at 26,688 parameters scored 0.49–0.52 on all four maps.
+**Read:** across all five 16x16 maps the Transformer wins on **mean success (+0.139)** and
+on **decoder generations on every map (1.5–4.7× fewer)**, while emitting **3.00–3.05-action
+plans** against the MLP's 1.13–2.06. Two cells carry it — `obstacles_15p` **+0.321** and
+`obstacles_25p` **+0.426**, the two maps the MLP handles worst. It trails on `corridors`
+(−0.050) and ties on `room_v1` (−0.009) and `16x16_empty` (+0.008).
 
-Seeds: `16x16_empty` **n=2 (0.893 / 0.889)**; the other two cells are **n=1**.
-`obstacles_15p` and `corridors` have not been run at this size — at 26,688 the MLP led
-`obstacles_15p` 0.636 vs 0.497, so this is three maps, not five.
+Compare Table 2: the same architecture at 26,688 parameters scored **0.487–0.520 on every
+map**, i.e. flat and insensitive to map difficulty. Mean success goes 0.505 → **0.783** from
+deleting parameters.
+
+Seeds: `16x16_empty` **n=2 (0.893 / 0.889)**, `obstacles_25p` **n=2 (0.846 / 0.803)**;
+`obstacles_15p`, `corridors` and `room_v1` are **n=1**. MLP is n=2 on `16x16_empty` only.
+
+Wall clock: GPT 6.2–6.7h per run against the MLP's 13.6h.
 
 The decoder-size sweep that produced it, on `16x16_empty` @100:
 
@@ -133,14 +141,27 @@ Monotone in size, with a replicated baseline. **+0.363 from deleting parameters.
 
 ### And it costs nothing at 500 pairs
 
-| 16x16_empty @500 | success | gen/ep | step ratio |
-|---|---|---|---|
-| GPT 1,192 | **1.000** | **3.07** | **0.993** |
-| GPT 7,200 | 0.974 | — | — |
-| GPT 26,688 | 0.994 | 3.42 | 0.946 |
-| MLP 2,466 | 1.000 | 5.73 | 0.889 |
+| map @500 | GPT 1,192 | GPT 26,688 | MLP | shrink Δ |
+|---|---|---|---|---|
+| 16x16_obstacles_v1_25p | **0.991** | 0.915 | 0.953 | **+0.076** |
+| 16x16_empty | **1.000** | 0.994 | 1.000 | +0.006 |
+| 16x16_room_v1 | 0.939 | 0.945 | 0.980 | −0.006 |
 
-Regression checks on `room_v1` and `obstacles_25p` at 500 pairs are in flight.
+**No regression anywhere, and `obstacles_25p` gains +0.076.** The shrink is strictly
+adoptable, not a starved-regime-only fix.
+
+Sequence-level metrics at 500 pairs (GPT 1,192):
+
+| | success | gen/ep | step ratio | plan len |
+|---|---|---|---|---|
+| 16x16_empty | 1.000 | **3.07** | **0.993** | 3.00 |
+| obstacles_25p | 0.991 | **3.74** | **0.882** | 3.00 |
+| room_v1 | 0.939 | **4.71** | **0.801** | 3.00 |
+| *16x16_empty @ 26,688* | 0.994 | 3.42 | 0.946 | 3.00 |
+| *16x16_empty : MLP* | 1.000 | 5.73 | 0.889 | 1.80 |
+
+A 0.993 step ratio is near-optimal pathing. Note `room_v1` and `obstacles_25p` reached best
+validation at **980k and 955k** — still climbing at the 1M wall, so both are lower bounds.
 
 ### Two caveats that belong beside these numbers
 
