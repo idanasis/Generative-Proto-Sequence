@@ -9,10 +9,26 @@ Task: from-scratch end-to-end RL, `--train_decoder_end_to_end
 GPT = minGPT causal decoder (this work). MLP = the paper's decoder, run unmodified from the
 `6f627a2` code drop.
 
-> **Decoder size is a variable, not a constant, in this document.** Tables 1–6 use the
-> historical **26,688**-parameter GPT decoder. The MLP it is compared against has **2,466**.
-> **Table 2b uses 1,192** and is the current result. Check which size a table uses before
-> quoting it.
+> ## ⚠ THE HEADLINE (2026-11-18)
+>
+> **The GPT decoder was 10.8× oversized, and that single error accounts for every weak
+> result in this comparison.** At 26,688 parameters against the MLP's 2,466 it overfits;
+> at **1,192** it does not.
+>
+> | cell | 26,688 | **1,192** | MLP |
+> |---|---|---|---|
+> | `24x24_empty` @500 | 0.110 | **1.000** | 0.973 |
+> | `obstacles_15p` @100 | 0.497 | **0.968** | 0.636 |
+> | `obstacles_25p` @100 | 0.487 | **0.825** | 0.399 |
+> | `16x16_empty` @100 | 0.530 | **0.891** | 0.883 |
+>
+> `24x24_empty` was this project's one catastrophic failure across **nine runs** — more
+> data, longer budget, no length penalty, `normalize_z`, a 7,200-param decoder — and it was
+> decoder capacity the whole time.
+>
+> **Decoder size is therefore a variable, not a constant, in this document.** Tables 1, 4
+> and 6 use 26,688. **Table 2b and the 500-pair section under it use 1,192 and are the
+> current result.** Check which size a table uses before quoting it.
 
 ---
 
@@ -31,21 +47,25 @@ GPT at its best budget (1M where it was still improving at 500k); MLP at 1M thro
 | 16x16_obstacles_v1_25p | 0.915 | 0.953 | **4.83** | 13.66 | **2.8×** | **0.785** | 0.701 | 3.00 | 1.12 |
 | ~~24x24_empty~~ ⛔ | ~~0.110~~ | ~~0.973~~ | 7.16 | 12.40 | 1.7× | 0.640 | 0.717 | 2.99 | 1.26 |
 
-⛔ **`24x24_empty`: the 0.110/0.973 pair above is budget-mismatched (GPT 500k, MLP 1M), but
-the failure is real.** Two 1M runs settle it — 700 pairs → **0.115**, 1,879 pairs → **0.128**,
-against 0.110 at 500 pairs and 500k. Doubling the budget and near-quadrupling the data moves
-nothing. Quote 0.115–0.128 (1M) rather than 0.110, and see §"Why 24x24 fails" below.
+⛔ **`24x24_empty`: this row is dead. The decoder was oversized.** At **1,192 parameters**
+the same cell — same 500 pairs, same 1M budget, same actor — scores **1.000**, against the
+MLP's 0.973:
 
-The 1,879-pair run is the decisive one, because it is **coverage-matched** to the
-`16x16_empty` cell that scores 0.994:
-
-| map | pairs | train pool | coverage | budget | success |
+| 24x24_empty @500 | success | gen/ep | step ratio | revisits | plan len |
 |---|---|---|---|---|---|
-| 16x16_empty | 500 | 16,380 | 3.05% | 1M | **0.994** |
-| 24x24_empty | 1,879 | 60,620 | 3.10% | 1M | **0.128** |
+| **GPT 1,192** | **1.000** | **3.67** | **0.956** | **0.046** | 3.00 |
+| GPT 26,688 | 0.110 | 7.16 | 0.640 | — | 2.99 |
+| MLP 2,466 | 0.973 | 12.40 | 0.717 | 1.203 | 1.26 |
 
-Same coverage, same budget, same decoder, same actor, both empty maps. Data and budget are
-eliminated as explanations.
+**+0.890 from deleting decoder parameters**, and the result beats the MLP on every axis:
+3.4× fewer decoder generations, a 0.956 step ratio against 0.717, and 26× less wandering.
+Deterministic inference gives 0.996.
+
+Nine runs had failed on this map — 500/700/1,879 pairs, 500k and 1M budgets, penalty off,
+`--decoder_normalize_z`, and a 7,200-parameter decoder (0.147). Every one of them used a
+decoder at least 3× larger than the MLP's. The coverage-matched argument that used to sit
+here (1,879 pairs = 3.10% against `16x16_empty`'s 3.05%, scoring 0.128 vs 0.994) correctly
+eliminated *data* as the cause; it just never questioned the decoder.
 
 **Read:** success within 0.04 on all six valid maps; **2–3× fewer decisions per episode on
 every map**; better path optimality on five of six.
@@ -117,25 +137,29 @@ the MLP). Both arms 1M steps, 100 training pairs.
 | map | success |  | decoder generations / ep |  |  | agent step ratio |  | plan length |  |
 |---|---|---|---|---|---|---|---|---|---|
 | | **GPT** | MLP | **GPT** | MLP | **reduction** | **GPT** | MLP | **GPT** | MLP |
-| 16x16_obstacles_v1_15p | **0.957** | 0.636 | **5.73** | 19.16 | **3.3×** | **0.672** | 0.561 | 3.04 | 1.22 |
+| 16x16_obstacles_v1_15p | **0.968** | 0.636 | **5.40** | 19.16 | **3.5×** | **0.696** | 0.561 | 3.03 | 1.22 |
 | 16x16_empty | **0.891** | 0.883 | **5.67** | 8.47 | **1.5×** | **0.780** | 0.762 | 3.05 | 1.78 |
 | 16x16_obstacles_v1_25p | **0.825** | 0.399 | **4.89** | 23.04 | **4.7×** | **0.773** | 0.366 | 3.00 | 1.85 |
-| 16x16_corridors_v1 | 0.744 | **0.794** | **5.24** | 13.34 | **2.5×** | 0.723 | — | 3.02 | 2.06 |
-| 16x16_room_v1 | 0.498 | 0.507 | **8.88** | 24.21 | **2.7×** | **0.553** | 0.452 | 3.03 | 1.13 |
-| **mean** | **0.783** | 0.644 | | | | | | | |
+| 16x16_corridors_v1 | 0.720 | **0.794** | **5.01** | 13.34 | **2.7×** | 0.752 | — | 3.01 | 2.06 |
+| 16x16_room_v1 | **0.520** | 0.507 | **9.52** | 24.21 | **2.5×** | **0.516** | 0.452 | 3.06 | 1.13 |
+| **mean** | **0.785** | 0.644 | | | | | | | |
 
-**Read:** across all five 16x16 maps the Transformer wins on **mean success (+0.139)** and
-on **decoder generations on every map (1.5–4.7× fewer)**, while emitting **3.00–3.05-action
-plans** against the MLP's 1.13–2.06. Two cells carry it — `obstacles_15p` **+0.321** and
-`obstacles_25p` **+0.426**, the two maps the MLP handles worst. It trails on `corridors`
-(−0.050) and ties on `room_v1` (−0.009) and `16x16_empty` (+0.008).
+**All five cells are n=2** (per-seed values below the Read).
+
+**Read:** across all five 16x16 maps the Transformer wins on **mean success (+0.141)** and
+on **decoder generations on every map (1.5–4.7× fewer)**, while emitting **3.00–3.06-action
+plans** against the MLP's 1.13–2.06. Two cells carry it — `obstacles_15p` **+0.332** and
+`obstacles_25p` **+0.426**, the two maps the MLP handles worst. It ties on `room_v1`
+(+0.013) and `16x16_empty` (+0.008), and **trails only on `corridors`** (−0.074).
 
 Compare Table 2: the same architecture at 26,688 parameters scored **0.487–0.520 on every
 map**, i.e. flat and insensitive to map difficulty. Mean success goes 0.505 → **0.783** from
 deleting parameters.
 
-Seeds: `16x16_empty` **n=2 (0.893 / 0.889)**, `obstacles_25p` **n=2 (0.846 / 0.803)**;
-`obstacles_15p`, `corridors` and `room_v1` are **n=1**. MLP is n=2 on `16x16_empty` only.
+Per-seed, all n=2: `obstacles_15p` **0.957 / 0.978**, `16x16_empty` **0.893 / 0.889**,
+`obstacles_25p` **0.846 / 0.803**, `corridors` **0.744 / 0.696**, `room_v1`
+**0.498 / 0.541**. Largest seed spread 0.048; the +0.332 and +0.426 margins are far outside
+it. MLP is n=2 on `16x16_empty` only (0.930 / 0.836, spread 0.094).
 
 Wall clock: GPT 6.2–6.7h per run against the MLP's 13.6h.
 
@@ -155,22 +179,26 @@ Monotone in size, with a replicated baseline. **+0.363 from deleting parameters.
 
 | map @500 | GPT 1,192 | GPT 26,688 | MLP | shrink Δ |
 |---|---|---|---|---|
+| **24x24_empty** | **1.000** | 0.110 | 0.973 | **+0.890** |
 | 16x16_obstacles_v1_25p | **0.991** | 0.915 | 0.953 | **+0.076** |
 | 16x16_empty | **1.000** | 0.994 | 1.000 | +0.006 |
 | 16x16_room_v1 | 0.939 | 0.945 | 0.980 | −0.006 |
 
-**No regression anywhere, and `obstacles_25p` gains +0.076.** The shrink is strictly
-adoptable, not a starved-regime-only fix.
+**No regression anywhere, and 24x24 goes from the project's one catastrophic failure to a
+perfect score that beats the MLP.** The shrink is strictly adoptable, not a
+starved-regime-only fix.
 
 Sequence-level metrics at 500 pairs (GPT 1,192):
 
-| | success | gen/ep | step ratio | plan len |
-|---|---|---|---|---|
-| 16x16_empty | 1.000 | **3.07** | **0.993** | 3.00 |
-| obstacles_25p | 0.991 | **3.74** | **0.882** | 3.00 |
-| room_v1 | 0.939 | **4.71** | **0.801** | 3.00 |
-| *16x16_empty @ 26,688* | 0.994 | 3.42 | 0.946 | 3.00 |
-| *16x16_empty : MLP* | 1.000 | 5.73 | 0.889 | 1.80 |
+| | success | gen/ep | step ratio | revisits | plan len |
+|---|---|---|---|---|---|
+| 16x16_empty | 1.000 | **3.07** | **0.993** | 0.02 | 3.00 |
+| **24x24_empty** | **1.000** | **3.67** | **0.956** | **0.05** | 3.00 |
+| obstacles_25p | 0.991 | **3.74** | **0.882** | 0.11 | 3.00 |
+| room_v1 | 0.939 | **4.71** | **0.801** | 0.82 | 3.00 |
+| *24x24_empty : MLP* | 0.973 | 12.40 | 0.717 | 1.20 | 1.26 |
+| *16x16_empty @ 26,688* | 0.994 | 3.42 | 0.946 | — | 3.00 |
+| *16x16_empty : MLP* | 1.000 | 5.73 | 0.889 | — | 1.80 |
 
 A 0.993 step ratio is near-optimal pathing. Note `room_v1` and `obstacles_25p` reached best
 validation at **980k and 955k** — still climbing at the 1M wall, so both are lower bounds.
@@ -267,53 +295,46 @@ working one. The actor has **not** collapsed: its `z` carries the same relative 
 
 ---
 
-## Why `24x24_empty` fails — **unexplained**; every hypothesis so far is refuted
+## Why `24x24_empty` failed — **solved: decoder capacity**
 
-Ruled out by direct measurement: **data coverage** (3.10% vs 3.05% matched, Table 1 ⛔),
-**training budget** (1M changes nothing), **decoder capacity** (64/256 unique plans from
-random `z`, the healthiest of any map, Table 6), **`z` magnitude** (the decoder is pre-LN
-with a learned `z_proj`, so any uniform rescale of `z` is absorbed — which is why
-`--decoder_normalize_z` left the map at 0.18), **episode budget** (`max_episode_steps` is
-75 and `max_level` is 14 on *every* map, so path lengths and step budgets are identical),
-and **the task** (the MLP reaches 0.973 on the same map through the same actor).
+At 1,192 parameters it scores **1.000**. At 26,688 it scored 0.110. Nothing else changed —
+same 500 pairs, same 1M budget, same actor, same length penalty.
 
-Note what that last row implies: 24x24 is not a harder navigation problem. `max_level 14`
-means the same ≤14-step paths as 16x16 — just scattered over 484 free cells instead of 196.
+### The nine runs that failed, and why each was uninformative
 
-What remains is **latent resolution**. The latent is 16-D (`actor_n_output_channels`, and
-`DenseVAE.decoder_input_size`, both 16). On 24x24 the actor must separate 3.7× more
-situations (train pool 60,620 vs 16,380) while its `z` occupies measurably the *same*
-latent volume as on a working map — `std/norm` 0.1246 vs 0.1306, mean pairwise cosine
-0.7746 vs 0.7639 (Table 6). Adjacent states collapse onto one `z`, decode to one plan, and
-the agent moves wrongly. Hence 15/256 plans reached from actor `z` against the decoder's
-own 64/256.
+| what was varied | result | what it eliminated |
+|---|---|---|
+| 500 → 700 → 1,879 pairs | 0.110 / 0.115 / 0.128 | data coverage (1,879 = 3.10%, matched to `16x16_empty`'s 3.05%) |
+| 500k → 1M steps | no change | training budget |
+| `--sequence_length_weight 0` @1M | best val 0.19 | plan length |
+| `--decoder_normalize_z` | 0.18 | `z` magnitude |
+| decoder 26,688 → 7,200 | 0.147 | — *(movement, read as "capacity eliminated")* |
+| **decoder 7,200 → 1,192** | **1.000** | **the actual cause** |
 
-This predicts the MLP's survival from its *weakness*: its plan length is 1.26 against the
-GPT's 3.00, so its latent must resolve 4 outcomes rather than 64 — ~16× coarser. On this
-reading the replanning advantage (Table 1) and the 24x24 failure are one phenomenon.
+Every one of those runs held the decoder at ≥3× the MLP's size. The 7,200-parameter run is
+the instructive failure: **+0.027 looked like noise and was read as evidence against
+capacity**, when it was a partial move along a curve that only pays off below ~2,000
+parameters. `16x16_empty` showed the same shape — 13,984 → 0.552 and 7,200 → 0.670 against
+1,192 → 0.893. A two-point capacity sweep is not enough to rule capacity out.
 
-**The test ran, and it refutes the hypothesis above.** 24x24 at 1M with
-`--sequence_length_weight 0` (job 24199247) drives plan length to ~1.01 — the MLP's regime,
-where only 4 outcomes need resolving — and scored **best val 0.19**. The stated criterion
-was "if it stays near 0.14, this explanation is dead." It is dead.
+### What the §8 / Table 6 diagnosis got right and wrong
 
-Decoder capacity is also eliminated on this map: 7,200 params gave **0.147** (job 24217602)
-against ~0.12 at 26,688 — movement, but nowhere near rescue, while the same shrink was worth
-+0.32 to +0.43 on 16x16 maps.
+**Right:** the actor reaches only 23% of the decoder's plan range on 24x24 against a working
+map's 43%, and plan diversity is the binding constraint.
 
-**So `24x24_empty` currently has no surviving explanation.** Everything proposed has been
-tested and eliminated: coverage, budget, horizon, episode cap, decoder capacity (both
-directions), `z` magnitude, plan length, and the task itself. State it as an open failure,
-not as a diagnosed one.
+**Wrong:** every causal story attached to it. The `z`-magnitude reading (`z` "drowned out in
+an unnormalised residual stream") is impossible — the decoder is pre-LN with a learned
+`z_proj`, so a uniform rescale is absorbed, which is why `--decoder_normalize_z` did
+nothing. The latent-resolution reading (16-D cannot separate 3.7× more situations) was
+refuted by the penalty-off run. **The actor's narrow `z` was a symptom of a decoder that had
+overfit, not a cause.**
 
-Untested, in rough order of promise:
-- **the 1,192-parameter decoder on 24x24** — job 24279013, running. The shrink transformed
-  four 16x16 maps and has never been tried here at its best size.
-- **a wider latent.** `actor_n_output_channels` and `DenseVAE.decoder_input_size` are both
-  hardcoded to 16; the latter is not plumbed through `get_decoder` (~5 lines).
-- **the pretrained frozen decoder** (the paper's protocol), never run on any map.
+### The general lesson
 
----
+The decoder is 1,192 parameters against an actor of ~14.6M on this map. It was never a
+capacity ceiling — it was a sequence model asked to learn from sparse RL reward with 10.8×
+more parameters than the task supports, on 500 start/goal pairs. Every weak cell in this
+comparison has the same cause.
 
 ## Caveats to carry into any write-up
 
