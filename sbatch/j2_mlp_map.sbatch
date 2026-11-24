@@ -50,6 +50,28 @@ TRAIN_PAIRS="${2:-500}"
 # the GPT trails do so by 0.006-0.038, and a 1-seed baseline cannot distinguish that from a
 # tie. Pass 1 here to get the replicate.
 NONDETERMINISTIC="${3:-0}"
+
+# 4th-7th args: the paper's protocol knobs. Defaults reproduce every historical j2 run.
+#
+#   j2 <map> [pairs] [nondeterministic] [total_steps] [start_level] [max_level] [paper_decoder]
+#   j2 16x16_room_v1 100 1 1500000 20 30 1      <- the paper's actual configuration
+#
+# hypersearch-grid-gps.py:66-68,92,95 gives the published protocol as total_timesteps
+# 1500000, start_level 20, max_level 30, train_decoder_end_to_end False and
+# initialize_decoder_from_pretrained True. Every run in this repo used 1M steps, levels
+# 1-14 and a from-scratch end-to-end decoder, for BOTH arms. The comparison is internally
+# fair but **no number in RESULTS.md can be set against a published figure**.
+#
+# paper_decoder=1 flips the MLP to pretrained + frozen. Its checkpoint has shipped since
+# 6f627a2 (denseAE_generic_2act_seq_VAE_v7_...pt, 2,466-param decoder) and is the Config
+# default for --decoder_model_path, so no path argument is needed. The GPT side needs a
+# matching checkpoint from pretrain_decoder.py, passed as j1's 9th argument.
+#
+# 8x8_empty cannot run levels 20-30: its diameter is 14.
+TOTAL_STEPS="${4:-1000000}"
+START_LEVEL="${5:-1}"
+MAX_LEVEL="${6:-14}"
+PAPER_DECODER="${7:-0}"
 WORKTREE="${HOME}/gps-mlp-baseline"
 
 if [ -z "${MAP}" ]; then
@@ -77,8 +99,14 @@ if [ "${NONDETERMINISTIC}" != "0" ]; then
     DET_ARGS=(--no-torch_deterministic)
 fi
 
+# Default: from scratch, end-to-end -- as every historical j2 run.
+PRETRAIN_ARGS=(--train_decoder_end_to_end --no-initialize_decoder_from_pretrained)
+if [ "${PAPER_DECODER}" != "0" ]; then
+    PRETRAIN_ARGS=(--initialize_decoder_from_pretrained --no-train_decoder_end_to_end)
+fi
+
 cd "${WORKTREE}" || exit 1
-echo "=== J2: map=${MAP}  train_pairs=${TRAIN_PAIRS}  nondeterministic=${NONDETERMINISTIC}  from $(pwd) at $(git rev-parse --short HEAD) ==="
+echo "=== J2: map=${MAP}  train_pairs=${TRAIN_PAIRS}  nondeterministic=${NONDETERMINISTIC}  total_steps=${TOTAL_STEPS}  levels=${START_LEVEL}-${MAX_LEVEL}  paper_decoder=${PAPER_DECODER}  from $(pwd) at $(git rev-parse --short HEAD) ==="
 
 START=$(date +%s)
 
@@ -90,8 +118,10 @@ poetry run python gps_simplegrid_levels.py \
     --train_eval_dataset_size 100 \
     --val_dataset_size 100 \
     --test_dataset_size 1000 \
-    --train_decoder_end_to_end \
-    --no-initialize_decoder_from_pretrained \
+    --total_timesteps "${TOTAL_STEPS}" \
+    --start_level "${START_LEVEL}" \
+    --max_level "${MAX_LEVEL}" \
+    "${PRETRAIN_ARGS[@]}" \
     "${DET_ARGS[@]}"
 
 END=$(date +%s)

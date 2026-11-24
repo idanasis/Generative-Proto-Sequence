@@ -124,6 +124,28 @@ DECODER_N_EMBD="${8:-32}"
 DECODER_CKPT="${9:-}"
 DECODER_FREEZE="${10:-1}"
 
+# 11th-12th args: the level range. Defaults 1/14 reproduce every run in this repo.
+#
+# THE PAPER'S PROTOCOL IS start_level=20, max_level=30 (hypersearch-grid-gps.py:66-68)
+# with total_timesteps=1500000. Everything here has run levels 1-14, so NO number in
+# RESULTS.md is comparable to a published figure -- and per EVIDENCE.md 8 this project has
+# never tested long horizons at all: max_level 14 caps every map regardless of size, so
+# 24x24_empty was short paths on a large canvas, not a longer horizon.
+#
+# That makes this more than bookkeeping. Replanning advantage should GROW with horizon --
+# more decisions per episode is exactly where acting over sequences pays. The measured
+# advantage is 1.7-3.5x at <=14 steps; 20-30 steps is the first test of whether it scales.
+#
+# Map diameters: 8x8 = 14 (levels 20-30 are IMPOSSIBLE there), 16x16 = 30, 24x24 = 46.
+# Raising max_level also changes the train pool, so coverage per pair count differs again
+# (RESULTS.md Table 5): a level-20-30 run is NOT comparable to a level-1-14 run.
+#
+# Also watch max_episode_steps (75): a 30-step optimal path leaves 2.5x slack where a
+# 14-step path had 5.4x. If success collapses at levels 20-30, rule that out before
+# concluding anything about the decoder.
+START_LEVEL="${11:-1}"
+MAX_LEVEL="${12:-14}"
+
 if [ -z "${MAP}" ]; then
     echo "ERROR: pass the obstacle map, e.g."
     echo "  sbatch $0 16x16_obstacles_v1_25p"
@@ -160,7 +182,7 @@ if [ "${LENGTH_WEIGHT}" != "0" ]; then
                  --min_lengths_per_head 4 --max_lengths_per_head 10)
 fi
 
-echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS}  z_all_positions=${Z_ALL_POSITIONS}  decoder=${DECODER_N_LAYER}L/${DECODER_N_HEAD}H/${DECODER_N_EMBD}E  pretrained=${DECODER_CKPT:-none}  freeze=${DECODER_FREEZE} ==="
+echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS}  z_all_positions=${Z_ALL_POSITIONS}  decoder=${DECODER_N_LAYER}L/${DECODER_N_HEAD}H/${DECODER_N_EMBD}E  pretrained=${DECODER_CKPT:-none}  freeze=${DECODER_FREEZE}  levels=${START_LEVEL}-${MAX_LEVEL} ==="
 
 START=$(date +%s)
 
@@ -184,6 +206,8 @@ poetry run python gps_simplegrid_levels.py \
     --decoder_n_layer "${DECODER_N_LAYER}" \
     --decoder_n_head "${DECODER_N_HEAD}" \
     --decoder_n_embd "${DECODER_N_EMBD}" \
+    --start_level "${START_LEVEL}" \
+    --max_level "${MAX_LEVEL}" \
     "${LENGTH_ARGS[@]}" \
     "${ZPOS_ARGS[@]}" \
     --slurm_job_id "${SLURM_JOB_ID}"

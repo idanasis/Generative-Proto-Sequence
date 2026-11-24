@@ -17,7 +17,7 @@ GPT = minGPT causal decoder (this work). MLP = the paper's decoder, run unmodifi
 >
 > | cell | 26,688 | **1,192** | MLP |
 > |---|---|---|---|
-> | `24x24_empty` @500 | 0.110 | **1.000** | 0.973 |
+> | `24x24_empty` @500 | 0.110 | **1.000** | 0.987 |
 > | `obstacles_15p` @100 | 0.497 | **0.968** | 0.636 |
 > | `obstacles_25p` @100 | 0.487 | **0.825** | 0.399 |
 > | `16x16_empty` @100 | 0.530 | **0.891** | 0.883 |
@@ -26,59 +26,75 @@ GPT = minGPT causal decoder (this work). MLP = the paper's decoder, run unmodifi
 > data, longer budget, no length penalty, `normalize_z`, a 7,200-param decoder — and it was
 > decoder capacity the whole time.
 >
+> **The two headline claims, stated carefully:**
+> - **At 500 pairs (Table 1) success is a tie** — GPT 0.978 vs MLP 0.984 across seven maps —
+>   **with 1.7–3.5× fewer replanning events and better path optimality on all seven.**
+> - **At 100 pairs (Table 2b) the GPT wins outright**, 0.785 vs 0.644 across five maps, with
+>   the same efficiency advantage.
+>
+> Both decoders now reach ~1.0 on `24x24_empty`, so that cell is a tie, not a win.
+>
 > **Decoder size is therefore a variable, not a constant, in this document.** Tables 1, 4
 > and 6 use 26,688. **Table 2b and the 500-pair section under it use 1,192 and are the
 > current result.** Check which size a table uses before quoting it.
 
 ---
 
-## Table 1 — main comparison, 500 training pairs
+## Table 1 — main comparison, 500 training pairs, **1,192-param decoder** (2026-11-24)
 
-GPT at its best budget (1M where it was still improving at 500k); MLP at 1M throughout.
+Complete 7-map sweep at the right decoder size. **GPT n=2 on every map.** MLP n=2 on
+`corridors`, `obstacles_15p`, `room_v1` and `24x24_empty`; n=1 elsewhere. Both arms 1M steps.
 
-| map | success |  | decoder generations / episode |  |  | agent step ratio |  | plan length |  |
-|---|---|---|---|---|---|---|---|---|---|
-| | **GPT** | MLP | **GPT** | MLP | **reduction** | **GPT** | MLP | **GPT** | MLP |
-| 8x8_empty | 1.000 | 1.000 | **2.19** | 3.92 | **1.8×** | **0.977** | 0.934 | 3.00 | 1.64 |
-| 16x16_empty | 0.994 | 1.000 | **3.42** | 5.73 | **1.7×** | **0.946** | 0.889 | 3.00 | 1.80 |
-| 16x16_corridors_v1 | **0.990** | 0.982 | **3.36** | 13.34 | **4.0×** | **0.936** | 0.573 | 3.01 | 2.06 |
-| 16x16_obstacles_v1_15p | 0.949 | 0.987 | **4.98** | 10.66 | **2.1×** | 0.755 | **0.825** | 3.00 | 1.09 |
-| 16x16_room_v1 | 0.945 | 0.980 | **4.56** | 11.56 | **2.5×** | **0.805** | 0.774 | 3.00 | 1.13 |
-| 16x16_obstacles_v1_25p | 0.915 | 0.953 | **4.83** | 13.66 | **2.8×** | **0.785** | 0.701 | 3.00 | 1.12 |
-| ~~24x24_empty~~ ⛔ | ~~0.110~~ | ~~0.973~~ | 7.16 | 12.40 | 1.7× | 0.640 | 0.717 | 2.99 | 1.26 |
+| map | success |  |  | decoder generations / ep |  |  | agent step ratio |  | plan length |  |
+|---|---|---|---|---|---|---|---|---|---|---|
+| | **GPT** | MLP | Δ | **GPT** | MLP | **reduction** | **GPT** | MLP | **GPT** | MLP |
+| 8x8_empty | 1.000 | 1.000 | 0.000 | **2.15** | 3.92 | **1.8×** | **0.985** | 0.934 | 3.00 | 1.64 |
+| **24x24_empty** | **1.000** | 0.987 | +0.013 | **3.59** | 8.32 | **2.3×** | **0.963** | 0.823 | 3.00 | 1.55 |
+| 16x16_empty | 0.997 | 1.000 | −0.003 | **3.43** | 5.73 | **1.7×** | **0.949** | 0.889 | 3.00 | 1.80 |
+| 16x16_corridors_v1 | 0.987 | 0.991 | −0.004 | **3.19** | 8.61 | **2.7×** | **0.957** | 0.896 | 3.00 | 1.17 |
+| 16x16_obstacles_v1_15p | 0.985 | 0.980 | +0.005 | **3.93** | 10.66 | **2.7×** | **0.857** | 0.825 | 3.00 | 1.09 |
+| 16x16_obstacles_v1_25p | 0.963 | 0.953 | +0.010 | **3.94** | 13.66 | **3.5×** | **0.863** | 0.701 | 3.00 | 1.12 |
+| 16x16_room_v1 | 0.916 | 0.977 | **−0.061** | **4.91** | 11.56 | **2.4×** | **0.786** | 0.774 | 3.00 | 1.13 |
+| **mean** | **0.978** | **0.984** | −0.006 | | | | | | | |
 
-⛔ **`24x24_empty`: this row is dead. The decoder was oversized.** At **1,192 parameters**
-the same cell — same 500 pairs, same 1M budget, same actor — scores **1.000**, against the
-MLP's 0.973:
+**Read: success is a tie (−0.006 mean), and every efficiency axis favours the Transformer.**
+It replans **1.7–3.5× less often on all seven maps** and follows more direct paths on
+**all seven**, while emitting 3.00-action plans against the MLP's 1.09–1.80. No cell won by
+collapsing to short plans — plan length is 3.00±0.01 everywhere.
 
-| 24x24_empty @500 | success | gen/ep | step ratio | revisits | plan len |
-|---|---|---|---|---|---|
-| **GPT 1,192** | **1.000** | **3.67** | **0.956** | **0.046** | 3.00 |
-| GPT 26,688 | 0.110 | 7.16 | 0.640 | — | 2.99 |
-| MLP 2,466 | 0.973 | 12.40 | 0.717 | 1.203 | 1.26 |
+Per-seed (GPT): 8x8 1.000/1.000, 24x24 1.000/1.000, empty 1.000/0.994, corridors 0.974/0.999,
+obstacles_15p 0.985/0.985, obstacles_25p 0.991/0.935, room_v1 0.939/0.893. **Seed spread
+reaches 0.056**, so treat anything under ~0.06 as a tie — which covers every cell except
+`room_v1`.
 
-**+0.890 from deleting decoder parameters**, and the result beats the MLP on every axis:
-3.4× fewer decoder generations, a 0.956 step ratio against 0.717, and 26× less wandering.
-Deterministic inference gives 0.996.
+`room_v1` is the one real deficit (−0.061) and the only map where the smaller decoder scored
+below the oversized one (0.916 vs 0.945). Unexplained. It still wins the efficiency axes
+there (4.91 vs 11.56 generations/ep).
 
-Nine runs had failed on this map — 500/700/1,879 pairs, 500k and 1M budgets, penalty off,
-`--decoder_normalize_z`, and a 7,200-parameter decoder (0.147). Every one of them used a
-decoder at least 3× larger than the MLP's. The coverage-matched argument that used to sit
-here (1,879 pairs = 3.10% against `16x16_empty`'s 3.05%, scoring 0.128 vs 0.994) correctly
-eliminated *data* as the cause; it just never questioned the decoder.
+### The 24x24 correction
 
-**Read:** success within 0.04 on all six valid maps; **2–3× fewer decisions per episode on
-every map**; better path optimality on five of six.
+An earlier version of this file claimed 1.000 "beats the MLP's 0.973". **It does not** — the
+MLP's second seed came back at **1.000**. Both decoders solve that map. What stands is that
+the GPT went **0.110 → 1.000** on decoder size alone, with 2.3× fewer replans and 0.963
+against 0.823 path optimality.
 
-> **Partly superseded at 1,192 parameters.** Three of these cells have been re-run with the
-> right-sized decoder (Table 2b, "it costs nothing at 500 pairs"): `obstacles_25p`
-> 0.915 → **0.991**, `16x16_empty` 0.994 → **1.000**, `room_v1` 0.945 → 0.939. The other
-> four maps have **not** been re-run at 500 pairs with 1,192 params, so this table is still
-> the only complete 500-pair sweep — but its GPT column understates what the current decoder
-> does.
+Note the MLP improved on both cells that finally got a real second seed (corridors
+0.982 → 0.999, 24x24 0.973 → 1.000): its older numbers were deterministic `seed=123` only
+(see caveat 5).
 
-`n=2` for `16x16_room_v1` (0.961, 0.929), `16x16_obstacles_v1_25p` (0.924, 0.905) and
-`24x24_empty` (0.120, 0.099); `n=1` elsewhere. MLP is `n=1` throughout.
+### Superseded: the same sweep at 26,688 parameters
+
+Kept because most of this document's analysis was written from it.
+
+| map | GPT 26,688 | MLP | GPT gen/ep |
+|---|---|---|---|
+| 8x8_empty | 1.000 | 1.000 | 2.19 |
+| 16x16_empty | 0.994 | 1.000 | 3.42 |
+| 16x16_corridors_v1 | 0.990 | 0.982 | 3.36 |
+| 16x16_obstacles_v1_15p | 0.949 | 0.987 | 4.98 |
+| 16x16_room_v1 | 0.945 | 0.980 | 4.56 |
+| 16x16_obstacles_v1_25p | 0.915 | 0.953 | 4.83 |
+| **24x24_empty** | **0.110** | 0.973 | 7.16 |
 
 ---
 
@@ -163,6 +179,20 @@ it. MLP is n=2 on `16x16_empty` only (0.930 / 0.836, spread 0.094).
 
 Wall clock: GPT 6.2–6.7h per run against the MLP's 13.6h.
 
+### `24x24_empty` at 100 pairs — both arms unstable
+
+Run for the first time on 2026-11-24, two seeds each. **Not quotable as a point estimate:**
+
+| | seed 1 | seed 2 | mean | spread |
+|---|---|---|---|---|
+| GPT 1,192 | 0.581 | 0.967 | 0.774 | **0.386** |
+| MLP 2,466 | 0.924 | 0.731 | 0.828 | **0.193** |
+
+At **0.16% coverage** — the lowest in the whole study (Table 5) — both decoders swing
+wildly. The GPT's two runs differ by 0.386, the MLP's by 0.193. Four or more seeds per arm
+would be needed before this cell says anything; the efficiency columns (GPT 6.88–8.22 vs MLP
+10.20–13.42 generations/ep) are the only part that is stable.
+
 The decoder-size sweep that produced it, on `16x16_empty` @100:
 
 | n_layer / n_head / n_embd | params | vs MLP | success |
@@ -177,16 +207,21 @@ Monotone in size, with a replicated baseline. **+0.363 from deleting parameters.
 
 ### And it costs nothing at 500 pairs
 
-| map @500 | GPT 1,192 | GPT 26,688 | MLP | shrink Δ |
-|---|---|---|---|---|
-| **24x24_empty** | **1.000** | 0.110 | 0.973 | **+0.890** |
-| 16x16_obstacles_v1_25p | **0.991** | 0.915 | 0.953 | **+0.076** |
-| 16x16_empty | **1.000** | 0.994 | 1.000 | +0.006 |
-| 16x16_room_v1 | 0.939 | 0.945 | 0.980 | −0.006 |
+**Superseded by Table 1**, which is now the complete 7-map n=2 sweep at 1,192 params. The
+shrink's effect on each cell, as deltas against the oversized decoder:
 
-**No regression anywhere, and 24x24 goes from the project's one catastrophic failure to a
-perfect score that beats the MLP.** The shrink is strictly adoptable, not a
-starved-regime-only fix.
+| map @500 | GPT 1,192 (n=2) | GPT 26,688 | shrink Δ |
+|---|---|---|---|
+| **24x24_empty** | **1.000** | 0.110 | **+0.890** |
+| 8x8_empty | 1.000 | 1.000 | 0.000 |
+| 16x16_empty | 0.997 | 0.994 | +0.003 |
+| 16x16_corridors_v1 | 0.987 | 0.990 | −0.003 |
+| 16x16_obstacles_v1_15p | 0.985 | 0.949 | **+0.036** |
+| 16x16_obstacles_v1_25p | 0.963 | 0.915 | **+0.048** |
+| 16x16_room_v1 | 0.916 | 0.945 | −0.029 |
+
+**Six of seven improve or hold; `room_v1` is the only loss.** The shrink is adoptable as the
+default, not a starved-regime-only fix.
 
 Sequence-level metrics at 500 pairs (GPT 1,192):
 
@@ -297,8 +332,12 @@ working one. The actor has **not** collapsed: its `z` carries the same relative 
 
 ## Why `24x24_empty` failed — **solved: decoder capacity**
 
-At 1,192 parameters it scores **1.000**. At 26,688 it scored 0.110. Nothing else changed —
-same 500 pairs, same 1M budget, same actor, same length penalty.
+At 1,192 parameters it scores **1.000** (n=2: 1.000 / 1.000). At 26,688 it scored 0.110.
+Nothing else changed — same 500 pairs, same 1M budget, same actor, same length penalty.
+
+The MLP also reaches **1.000** there once it gets a non-deterministic second seed (0.973 /
+1.000), so **this cell is a tie on success, not a GPT win.** What is not a tie: 3.59 vs 8.32
+decoder generations per episode and a 0.963 vs 0.823 step ratio.
 
 ### The nine runs that failed, and why each was uninformative
 

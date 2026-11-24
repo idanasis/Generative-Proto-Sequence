@@ -19,7 +19,7 @@ that normalises or rescales the actor's latent `z`.
 >
 > | cell | 26,688 | **1,192** | MLP (2,466) |
 > |---|---|---|---|
-> | `24x24_empty` @500 | 0.110 | **1.000** | 0.973 |
+> | `24x24_empty` @500 | 0.110 | **1.000** | 0.987 |
 > | `obstacles_15p` @100 | 0.497 | **0.968** | 0.636 |
 > | `obstacles_25p` @100 | 0.487 | **0.825** | 0.399 |
 > | `16x16_empty` @100 | 0.530 | **0.891** | 0.883 |
@@ -41,6 +41,14 @@ that normalises or rescales the actor's latent `z`.
 >
 > Also: the plan-length hypothesis is refuted at 1M on both open maps, and the MLP's
 > single-seed numbers in §8 are not safe — its spread at 100 pairs is **0.094**.
+>
+> **The two headline claims, stated carefully (§11.7):**
+> - **At 500 pairs success is a tie** — GPT 0.978 vs MLP 0.984 over seven maps — **with
+>   1.7–3.5× fewer replanning events and better path optimality on all seven.**
+> - **At 100 pairs the GPT wins outright**, 0.785 vs 0.644 over five maps.
+>
+> Both decoders now reach ~1.0 on `24x24_empty`, so that cell is a **tie, not a win**. An
+> earlier version of §11.2 said it beat the MLP's 0.973; the MLP's second seed is 1.000.
 >
 > Read **§11** before trusting any number in §1, §4, §8, §9 or §10.
 
@@ -1147,16 +1155,18 @@ version gave 0.974 against 0.994, inside noise), and whether it transfers to clu
 
 ### 11.2 `24x24_empty` — **SOLVED.** It was decoder capacity.
 
-**1,192-parameter decoder, 500 pairs, 1M steps: success 1.000** (deterministic 0.996),
-against 0.110 at 26,688 params and the MLP's 0.973. Nothing else changed.
+**1,192-parameter decoder, 500 pairs, 1M steps: success 1.000, n=2 (1.000 / 1.000)**,
+against 0.110 at 26,688 params. Nothing else changed.
 
-| 24x24_empty @500 | success | gen/ep | step ratio | revisits | plan len |
-|---|---|---|---|---|---|
-| **GPT 1,192** | **1.000** | **3.67** | **0.956** | **0.046** | 3.00 |
-| GPT 26,688 | 0.110 | 7.16 | 0.640 | — | 2.99 |
-| MLP 2,466 | 0.973 | 12.40 | 0.717 | 1.203 | 1.26 |
+| 24x24_empty @500 | success | gen/ep | step ratio | plan len |
+|---|---|---|---|---|
+| **GPT 1,192** | **1.000** *(n=2)* | **3.59** | **0.963** | 3.00 |
+| GPT 26,688 | 0.110 | 7.16 | 0.640 | 2.99 |
+| MLP 2,466 | 0.987 *(.973/1.000)* | 8.32 | 0.823 | 1.55 |
 
-**+0.890 from deleting parameters**, and it now beats the MLP on every axis.
+**+0.890 from deleting parameters.** But note: **the MLP also reaches 1.000 here** once it
+gets a proper non-deterministic second seed, so **success on this cell is a tie.** What is
+not a tie is 3.59 vs 8.32 generations per episode and 0.963 vs 0.823 path optimality.
 
 #### Nine failed runs, and why none of them found it
 
@@ -1242,6 +1252,49 @@ protocol. The MLP's checkpoint has shipped since `6f627a2`; only the GPT was mis
   run bit-for-bit — which is why the MLP column was n=1 everywhere while `j1` (which
   hardcodes `--no-torch_deterministic`) showed seed spread. **Fixed:** `j2 <map> [pairs] [1]`,
   third argument 1 for an independent sample.
+
+### 11.7 The complete 500-pair sweep at 1,192 params (2026-11-24)
+
+All seven maps, **GPT n=2 everywhere**, MLP n=2 on four. Both arms 1M steps. This replaces
+§8's table and RESULTS.md Table 1.
+
+| map | GPT | MLP | Δ | GPT gen/ep | MLP gen/ep | reduction | GPT ratio | MLP ratio |
+|---|---|---|---|---|---|---|---|---|
+| 8x8_empty | 1.000 | 1.000 | 0.000 | **2.15** | 3.92 | 1.8× | **0.985** | 0.934 |
+| 24x24_empty | 1.000 | 0.987 | +0.013 | **3.59** | 8.32 | 2.3× | **0.963** | 0.823 |
+| 16x16_empty | 0.997 | 1.000 | −0.003 | **3.43** | 5.73 | 1.7× | **0.949** | 0.889 |
+| 16x16_corridors_v1 | 0.987 | 0.991 | −0.004 | **3.19** | 8.61 | 2.7× | **0.957** | 0.896 |
+| 16x16_obstacles_v1_15p | 0.985 | 0.980 | +0.005 | **3.93** | 10.66 | 2.7× | **0.857** | 0.825 |
+| 16x16_obstacles_v1_25p | 0.963 | 0.953 | +0.010 | **3.94** | 13.66 | 3.5× | **0.863** | 0.701 |
+| 16x16_room_v1 | 0.916 | 0.977 | **−0.061** | **4.91** | 11.56 | 2.4× | **0.786** | 0.774 |
+| **mean** | **0.978** | **0.984** | −0.006 | | | | | |
+
+**Success is a tie. Replanning is 1.7–3.5× lower on all seven maps and path optimality is
+better on all seven.** Plan length 3.00±0.01 throughout — nothing won by collapsing to
+short plans.
+
+GPT per-seed: 8x8 1.000/1.000, 24x24 1.000/1.000, empty 1.000/0.994, corridors 0.974/0.999,
+obstacles_15p 0.985/0.985, obstacles_25p 0.991/0.935, room 0.939/0.893. **Seed spread
+reaches 0.056** at this decoder size — looser than the oversized decoder's ±0.015 — so
+treat anything under ~0.06 as a tie. That covers every cell except `room_v1`.
+
+**`room_v1` is the only real deficit** (−0.061) and the only map where the smaller decoder
+scored *below* the oversized one (0.916 vs 0.945). Unexplained, at both 100 and 500 pairs.
+
+**The MLP's old numbers were understated.** Both cells that finally received a real second
+seed improved: corridors 0.982 → 0.999, 24x24 0.973 → 1.000. Every other MLP cell in this
+file is still deterministic `seed=123` only and should be read as a lower bound (§11.5).
+
+#### `24x24_empty` at 100 pairs — both arms unstable
+
+| | seed 1 | seed 2 | mean | spread |
+|---|---|---|---|---|
+| GPT 1,192 | 0.581 | 0.967 | 0.774 | **0.386** |
+| MLP 2,466 | 0.924 | 0.731 | 0.828 | **0.193** |
+
+At 0.16% coverage, the lowest in the study, both decoders swing wildly. **Not quotable as a
+point estimate** — four or more seeds per arm would be needed. Only the efficiency columns
+are stable (GPT 6.88–8.22 vs MLP 10.20–13.42 generations/ep).
 
 ### 11.6 Tooling added
 
