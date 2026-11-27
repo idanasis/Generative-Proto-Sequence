@@ -1296,6 +1296,133 @@ At 0.16% coverage, the lowest in the study, both decoders swing wildly. **Not qu
 point estimate** — four or more seeds per arm would be needed. Only the efficiency columns
 are stable (GPT 6.88–8.22 vs MLP 10.20–13.42 generations/ep).
 
+### 11.8 The paper (TMLR 12/2025) — obtained 2026-11-27
+
+Fried, Giladi & Katz, *Generative Proto-Sequence: Sequence-Level Decision Making for
+Long-Horizon Reinforcement Learning*, TMLR 12/2025.
+OpenReview: https://openreview.net/forum?id=fSG2DRHtOg
+
+It has full quantitative results (Table 2: ASR at 100k/500k/1M/1.5M over **5 seeds**;
+Table 3: convergence step, PER, SGF). The GitHub README has none — do not conclude from the
+repo that no published numbers exist.
+
+#### 11.8.1 Level ranges are PER-MAP. Ours were not.
+
+Paper Table 1. **Every run in this repository used levels 1–14 on every map**, which is the
+paper's task only for 8x8.
+
+| environment | paper `[start–max]` | paper test set | paper test optimal path | ours |
+|---|---|---|---|---|
+| 8x8 | [1–14] | 1000 | 5.31 | **1–14 ✓** |
+| 16x16 empty | **[16–26]** | 1000 | 17.98 | 1–14 ✗ |
+| 16x16_obstacles_15% | **[20–30]** | **210** | 21.31 | 1–14 ✗ |
+| 16x16_obstacles_25% | **[20–30]** | **400** | 21.54 | 1–14 ✗ |
+| 16x16_rooms | **[20–30]** | **585** | 21.02 | 1–14 ✗ |
+| 16x16_corridors | **[10–30]** | **545** | 13.14 | 1–14 ✗ |
+| 24x24 empty | **[20–30]** | 1000 | 23.56 | 1–14 ✗ |
+| 24x24_obstacles_15/25% | **[10–20]** | 1000 | 14.73 / 15.11 | not shipped |
+
+This does **not** invalidate RESULTS.md — both arms always got identical data, so every
+per-map GPT-vs-MLP comparison stands. It means the *task* is not the paper's, so no number
+in §1–§11.7 may be set against a published figure. `j1`/`j2` now take the range as args
+11–12 / 5–6.
+
+**One run already matches**: `16x16_room_v1` at levels 20–30 produced a **586**-pair test set
+against the paper's **585**.
+
+#### 11.8.2 Use the paper's metric names
+
+| paper | this repo |
+|---|---|
+| **ASR** (average success rate) | `success` |
+| **PER** (path efficiency ratio, `l_opt / l_episode`) | `agent step ratio` |
+| **SGF** (sequence generation frequency) | `decoder generations/ep` |
+
+**SGF is the paper's own metric for what §9 calls the headline.** Use ASR/PER/SGF in any
+write-up.
+
+#### 11.8.3 Our one paper-protocol cell against the paper's number
+
+`16x16_rooms`, 100 pairs, 1.5M steps, levels 20–30 — our four runs (n=1 each) against the
+paper's GPS at 1.5M (5 seeds):
+
+| | ASR | SGF | PER |
+|---|---|---|---|
+| **paper GPS** (MLP, frozen pretrained) | **0.85 ± 0.07** | 16.27 | 0.68 |
+| **paper GPS-E2E** (MLP, end-to-end) | **0.90** | 30.37 | 0.70 |
+| ours: MLP frozen | **0.198** | 19.61 | 0.605 |
+| ours: MLP e2e | **0.498** | 36.85 | 0.602 |
+| ours: GPT 1,192 frozen | 0.616 | 10.94 | 0.590 |
+| ours: GPT 1,192 e2e | **0.853** | 8.98 | 0.868 |
+
+**SGF reproduces; ASR does not.** Our MLP's SGF lands within ~20% of the paper's in both
+modes (19.6 vs 16.3 frozen; 36.8 vs 30.4 e2e) and reproduces the paper's *direction*
+(frozen replans less than e2e). But our MLP ASR is 0.20–0.50 where the paper reports
+0.85–0.90.
+
+The likely cause is hyperparameters, not a structural difference: the paper **grid-searches
+per environment** over `actor_learning_rate` [1e-3, 1e-4, 1e-5], `buffer_size` [10000,
+50000], `tau` [0.01, 0.005], `actor_target_network_frequency` [10, 100] and
+`actor_linear_layers` ["512,32", "512,128,32"], and reports the best (Tables 21–22). We run
+one default config. The paper also samples exploration sequences **from the same 400-sequence
+PSD pool** (§4.3) — check whether this repo does that before blaming anything else.
+
+Worth noting: **our GPT at 1,192 params end-to-end scores 0.853, close to the paper's own
+GPS-E2E 0.90**, while our reproduction of their MLP reaches 0.498. We are not under-performing
+the paper's method; we are under-performing it *with their decoder*.
+
+#### 11.8.4 Appendix G is our GPS-vs-GPS-E2E experiment, with the opposite ASR result
+
+The paper ran this comparison (Table 10, single seed) and found **ASR parity** — e.g.
+`16x16_rooms` 0.91 vs 0.90, `16x16` 1.00 vs 1.00 — with the trade being **PER vs SGF**:
+pre-training gives lower SGF (more temporal abstraction), end-to-end gives higher PER.
+Its conclusion: "decoder pre-training is not a fundamental requirement."
+
+Our §11.4 finding that freezing *costs* 0.24–0.30 ASR therefore **disagrees with the paper on
+success** while **agreeing on the SGF/PER trade**. Given 11.8.3, treat our ASR gap as a
+hyperparameter artifact until the grid search is run. The SGF/PER half is reproduced.
+
+#### 11.8.5 The pretraining corpus limits are deliberate and documented
+
+Appendix M.1 states the five constraints exactly as `generate_valid_sequences.py` implements
+them: length 1–10, **at most two distinct action types**, **at most one switch**, no opposite
+directions, no loops → **400 unique sequences**. Their PSD trains 20,000 epochs to **0.978
+exact match / 0.99 per-step**.
+
+So the ≤2-action limit is by design, not an oversight. But §5.1 claims GPS still emits novel
+sequences violating those patterns — 11 of 15 sampled, including `[1,2,1,1]` and `[0,0,3,3,0,3]`
+(3 distinct actions, multiple switches). **The frozen decoder is not hard-limited to the
+corpus's structure**, which weakens the "corpus cannot express 3-direction plans" explanation
+in RESULTS.md. Keep the measurement, drop the certainty.
+
+#### 11.8.6 Other facts worth having
+
+- **`max_episode_steps = 75`** and an episode counts as success only under 75 steps
+  (Appendix H) — matches ours.
+- **Empty-sequence penalty −20** and a hard-coded DOWN action (N.3).
+- **Actor `pe_embedding_dim` = 128**, proto-sequence embedding **16-D** — matches ours.
+- **GPS vs GPS-D**: GPS uses Gumbel-Softmax, GPS-D argmax + straight-through. Our
+  `use_gumble_in_decoder` default True → we are **GPS**, not GPS-D. GPS-D consistently has
+  **higher PER, lower SGF** (§4.4.2).
+- **§5.5 actor scaling**: smaller actors beat larger ones on simpler maps, larger win on the
+  hardest — the same capacity story §11.1 found on the *decoder*, independently.
+- **PSD pre-training cost**: 10–15 min on an M1 Max (Appendix F). Ours: 8 min CPU.
+- **Limitations the paper states**: dense obstacles in medium mazes hurt GPS (16x16 25% is
+  its one loss to DQN/TempoRL); not evaluated on large or continuous action spaces.
+
+#### 11.8.7 The thesis direction is the paper's own stated future work
+
+> "we are considering the creation of a **re-planning component**, and mechanisms that will
+> **adapt the maximal length of the generated sequences** based on both available information
+> and local environment complexity" — §6
+
+Also §5.4: "**Confidence-conditioned sequence horizons** could allow the decoder to learn to
+generate shorter sequences when observation uncertainty is high." And §4.4.2 already frames
+GPS as **self-correcting** across decision points (Appendix E: 62.4–99.6% immediate
+correction). Adaptive replanning is the paper's named next step, and §11.3's finding that a
+pretrained decoder emits 11 distinct plan lengths while end-to-end training pins it to 3.000
+is direct evidence for it.
+
 ### 11.6 Tooling added
 
 | script | answers |

@@ -375,12 +375,93 @@ capacity ceiling — it was a sequence model asked to learn from sparse RL rewar
 more parameters than the task supports, on 500 start/goal pairs. Every weak cell in this
 comparison has the same cause.
 
+## Table 7 — the one cell comparable to the paper (2026-11-27)
+
+`16x16_rooms`, **100 pairs, 1.5M steps, levels 20–30** — the paper's exact setting for this
+map (our run produced a **586**-pair test set against the paper's **585**). Paper figures from
+TMLR 12/2025 Tables 2, 3 and 10. Ours are n=1; the paper's GPS column is 5 seeds.
+
+| | ASR | SGF | PER |
+|---|---|---|---|
+| **paper GPS** (MLP, frozen pretrained) | **0.85 ± 0.07** | 16.27 | 0.68 |
+| **paper GPS-E2E** (MLP, end-to-end) | **0.90** | 30.37 | 0.70 |
+| ours — MLP, frozen | 0.198 | 19.61 | 0.605 |
+| ours — MLP, end-to-end | 0.498 | 36.85 | 0.602 |
+| ours — GPT 1,192, frozen | 0.616 | **10.94** | 0.590 |
+| ours — **GPT 1,192, end-to-end** | **0.853** | **8.98** | **0.868** |
+
+**Read: SGF reproduces, ASR does not.** Our MLP's SGF lands within ~20% of the paper's in
+both modes and reproduces its *direction* (frozen replans less than end-to-end: 19.6 vs 36.8,
+against the paper's 16.3 vs 30.4). But our MLP ASR is 0.20–0.50 where the paper reports
+0.85–0.90.
+
+The most likely cause is hyperparameters. The paper **grid-searches per environment** over
+`actor_learning_rate` [1e-3, 1e-4, 1e-5], `buffer_size` [10000, 50000], `tau` [0.01, 0.005],
+`actor_target_network_frequency` [10, 100] and `actor_linear_layers`, and reports the best
+(its Tables 21–22). Every run here uses one default configuration. The paper also draws
+exploration sequences from the same 400-sequence PSD pool (its §4.3); whether this repo does
+that is unverified.
+
+**Our Transformer at 1,192 parameters, end-to-end, reaches 0.853 — close to the paper's own
+GPS-E2E figure of 0.90** — while our reproduction of their MLP reaches 0.498. The shortfall
+is in reproducing their decoder, not in ours.
+
+### The paper ran this comparison too, and disagrees with us on ASR
+
+Its Appendix G compares GPS against GPS-E2E and finds **ASR parity** (`16x16_rooms` 0.91 vs
+0.90; `16x16` 1.00 vs 1.00), concluding "decoder pre-training is not a fundamental
+requirement". The trade it reports is **PER vs SGF**: pre-training buys lower SGF, end-to-end
+buys higher PER.
+
+Our finding that freezing *costs* 0.24–0.30 ASR therefore **conflicts with the paper on
+success while agreeing on the SGF/PER trade**. Until the grid search is run, treat our ASR
+gap as a hyperparameter artifact rather than a result.
+
+### What the paper reports for GPS, for orientation
+
+ASR at 1.5M (or 1M where marked —), mean over 5 seeds, at its own per-map level ranges:
+
+| environment | GPS | best baseline |
+|---|---|---|
+| 8x8 | 1.00 — | DQN 0.85 |
+| 16x16 | 1.00 | DQN 0.74 |
+| 16x16_obstacles_15% | 0.94 | DQN 0.84 |
+| 16x16_obstacles_25% | **0.57** | **TempoRL 0.73** |
+| 16x16_rooms | 0.85 | TempoRL 0.67 |
+| 16x16_corridors | 0.98 — | TempoRL 0.89 |
+| 24x24 | 0.94 | TempoRL 0.52 |
+| 24x24_obstacles_15% | 0.83 | TempoRL 0.17 |
+| 24x24_obstacles_25% | 0.49 | DQN 0.10 |
+
+These are **not comparable to anything above** — different level ranges, different baselines
+(DQN/TempoRL/DAR rather than two decoders), 5 seeds. Quoted only so the scale is known.
+
+---
+
 ## Caveats to carry into any write-up
 
-1. **500 pairs is not the paper's protocol** (100). **Table 2b** gives the current 100-pair
-   numbers (Table 2 is the superseded oversized-decoder version); no direct comparison to
-   published figures without them. The paper also uses levels 20–30, 1.5M steps and a
-   pretrained frozen decoder, none of which was run here — see "In flight".
+1. **Not the paper's task.** The paper (TMLR 12/2025, Table 1) sets the start-goal distance
+   range **per map**; this repository used **levels 1–14 everywhere**, which is the paper's
+   setting only for 8x8:
+
+   | environment | paper `[start–max]` | paper test set | ours |
+   |---|---|---|---|
+   | 8x8 | [1–14] | 1000 | **1–14 ✓** |
+   | 16x16 empty | **[16–26]** | 1000 | 1–14 ✗ |
+   | 16x16_obstacles_15% | **[20–30]** | **210** | 1–14 ✗ |
+   | 16x16_obstacles_25% | **[20–30]** | **400** | 1–14 ✗ |
+   | 16x16_rooms | **[20–30]** | **585** | 1–14 ✗ |
+   | 16x16_corridors | **[10–30]** | **545** | 1–14 ✗ |
+   | 24x24 empty | **[20–30]** | 1000 | 1–14 ✗ |
+
+   Both arms always received identical data, so **every per-map comparison in this file
+   stands**. But the task is not the published one, so **no number here may be set against a
+   paper figure**, and 500 pairs is not the paper's 100 either. `j1`/`j2` now take the level
+   range as arguments. See EVIDENCE.md §11.8.
+
+   Also use the paper's metric names in any write-up: **ASR** = success, **PER** = agent step
+   ratio, **SGF** = decoder generations/ep. SGF is the paper's own name for this work's
+   headline metric.
 2. **`--train_dataset_size` is not comparable across maps** — see Table 5. Within a map both
    arms get identical data, so per-map comparisons are clean; cross-map ones are not.
 3. **`max_level` is 14 on every map**, so no environment here tests long horizons.
